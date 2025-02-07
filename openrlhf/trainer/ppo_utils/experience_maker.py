@@ -118,6 +118,7 @@ class Samples:
     action_mask: Optional[torch.BoolTensor]
     num_actions: Union[int, torch.Tensor]
     packed_seq_lens: Optional[torch.Tensor]
+    input_length: int
     response_length: torch.Tensor
     total_length: torch.Tensor
 
@@ -268,6 +269,7 @@ class NaiveExperienceMaker(ABC):
                 action_mask=action_mask,
                 num_actions=action_mask.size(1),
                 packed_seq_lens=None,
+                input_length=inputs["input_ids"].size(1),
                 response_length=action_mask.float().sum(dim=-1),
                 total_length=attention_mask.float().sum(dim=-1),
             )
@@ -329,6 +331,7 @@ class NaiveExperienceMaker(ABC):
                 action_mask=action_mask,
                 num_actions=action_mask.size(1),
                 packed_seq_lens=None,
+                input_length=prompt_ids["input_ids"].size(1),
                 response_length=action_mask.float().sum(dim=-1),
                 total_length=attention_mask.float().sum(dim=-1),
             )
@@ -352,6 +355,7 @@ class NaiveExperienceMaker(ABC):
         attention_mask = samples.attention_mask
         action_mask = samples.action_mask
         num_actions = samples.num_actions
+        input_length = samples.input_length
 
         # log probs
         action_log_probs = self.actor(sequences, num_actions, attention_mask)
@@ -368,8 +372,10 @@ class NaiveExperienceMaker(ABC):
         # rewards
         if self.remote_rm_url is not None:
             # remote RM
-            queries = self.tokenizer.batch_decode(sequences.cpu(), skip_special_tokens=True)
-            r = remote_rm_fn(self.remote_rm_url, queries=queries).to(device=action_log_probs.device)
+            seqs = self.tokenizer.batch_decode(sequences.cpu(), skip_special_tokens=True)
+            responses = self.tokenizer.batch_decode(sequences[:, input_length:].cpu(), skip_special_tokens=True)
+            queries = self.tokenizer.batch_decode(sequences[:, :input_length].cpu(), skip_special_tokens=True)
+            r = remote_rm_fn(self.remote_rm_url, sequences=seqs, queries=queries, responses=responses).to(device=action_log_probs.device)
             # r = torch.clamp(r, min=-1, max=1).to(torch.float)
         else:
             # local RM
@@ -583,6 +589,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         attention_mask = samples.attention_mask
         action_mask = samples.action_mask
         num_actions = samples.num_actions
+        input_length = samples.input_length
         packed_seq_lens = samples.packed_seq_lens
 
         start = time.time()
@@ -621,7 +628,9 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         else:
             # remote RM
             if not self.packing_samples:
-                queries = self.tokenizer.batch_decode(sequences_cpu, skip_special_tokens=False)
+                seqs = self.tokenizer.batch_decode(sequences_cpu, skip_special_tokens=True)
+                responses = self.tokenizer.batch_decode(sequences_cpu[:, input_length:], skip_special_tokens=True)
+                queries = self.tokenizer.batch_decode(sequences_cpu[:, :input_length], skip_special_tokens=True)
             else:
                 sequences_list = []
                 offset = 0
@@ -630,9 +639,11 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                     sequences_list.append(tokens_list[offset : offset + length])
                     offset += length
                 queries = self.tokenizer.batch_decode(sequences_list, skip_special_tokens=False)
+                seqs = queries
+                responses = queries
 
             for rm in self.remote_rm_url:
-                r = remote_rm_fn_ray.remote(rm, queries=queries)
+                r = remote_rm_fn_ray.remote(rm, sequences=seqs, queries=queries, responses=responses)
                 r_refs.append(r)
 
         # log probs
@@ -791,6 +802,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                         action_mask=action_mask,
                         num_actions=action_mask.size(1),
                         packed_seq_lens=None,
+                        input_length=sequences.size(1),
                         response_length=action_mask.float().sum(dim=-1),
                         total_length=attention_mask.float().sum(dim=-1),
                     )
@@ -828,6 +840,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                         action_mask=None,
                         num_actions=num_actions,
                         packed_seq_lens=packed_seq_lens,
+                        input_length=sequences.size(1),
                         response_length=response_length,
                         total_length=total_length,
                     )

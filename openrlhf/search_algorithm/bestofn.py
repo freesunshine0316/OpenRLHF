@@ -1,3 +1,4 @@
+import os
 import re
 import torch
 import random
@@ -8,12 +9,20 @@ N = 8
 TEMPERATURE = 1
 strategy = "voting"
 
-data_fpath_list = [
-    "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/gsm8k/train.jsonl",
-    "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/math/train.jsonl",
-    "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/gsm8k/test.jsonl",
-    "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/math/test.jsonl"
-]
+if os.path.exists("/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/gsm8k/train.jsonl"):
+    data_fpath_list = [
+        "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/gsm8k/train.jsonl",
+        "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/math/train.jsonl",
+        "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/gsm8k/test.jsonl",
+        "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/math/test.jsonl"
+    ]
+else:
+    data_fpath_list = [
+        "/apdcephfs_qy3/share_301812049/oakyu/exp.tencent_chat/Qwen2.5-Math-evaluation/data/gsm8k/train.jsonl",
+        "/apdcephfs_qy3/share_301812049/oakyu/exp.tencent_chat/Qwen2.5-Math-evaluation/data/math/train.jsonl",
+        "/apdcephfs_qy3/share_301812049/oakyu/exp.tencent_chat/Qwen2.5-Math-evaluation/data/gsm8k/test.jsonl",
+        "/apdcephfs_qy3/share_301812049/oakyu/exp.tencent_chat/Qwen2.5-Math-evaluation/data/math/test.jsonl"
+    ]
 
 dataset = []
 for data_fpath in data_fpath_list:

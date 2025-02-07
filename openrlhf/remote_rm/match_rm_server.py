@@ -1,3 +1,4 @@
+import os
 import traceback
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -6,59 +7,13 @@ from collections import defaultdict
 import jsonlines
 import re
 from openrlhf.remote_rm.grader import grade_answer
+from openrlhf.remote_rm.utils import extract_gsm8k_numbers, extract_answer, answer_dict
 from openrlhf.remote_rm.qwen_math_eval_toolkit.grader import math_equal as qwen_math_equal
 from openrlhf.remote_rm.qwen_math_eval_toolkit.parser import extract_answer as qwen_extract_answer
 from multiprocessing import Process, Queue
 
-data_fpath_list = [
-    "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/gsm8k/train.jsonl",
-    "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/math/train.jsonl",
-    "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/gsm8k/test.jsonl",
-    "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/math/test.jsonl"
-]
 
-dataset = []
-for data_fpath in data_fpath_list:
-    with jsonlines.open(data_fpath, 'r') as reader:
-        for item in reader:
-            if "gsm8k" in data_fpath:
-                question = item["question"]
-                answer = item["answer"].split("####")[-1].strip()
-                dataset.append({"question": question, "answer": answer, "type": "gsm8k"})
-            else:
-                question = item["problem"]
-                answer = item["answer"]
-                dataset.append({"question": question, "answer": answer, "type": "math"})
-
-
-def extract_numbers(text):
-    ANS_RE = re.compile(r"(\-?[0-9\.\,]+)")
-    match = ANS_RE.search(text)
-    try:
-        return match.group(1).strip()
-    except:
-        return "[INVALID]"
-
-def extract_answer(text, data_type):
-    if "he answer is:" in text:
-        text_split = text.split("he answer is:")
-    elif "he answer is" in text:
-        text_split = text.split("he answer is")
-    else:
-        return "[INVALID]"
-
-    if len(text_split) == 2:
-        content = text_split[-1].strip()
-        if content[-1] == ".":
-            content = content[:-1]
-        if data_type == "gsm8k":
-            content = extract_numbers(content)
-        return content
-    return "[INVALID]"
-
-answer_dict = {item["question"].strip(): {"ref": item["answer"], "type": item["type"]} for item in dataset}
-
-def get_reward_r1_zero(sequences):
+def get_reward_r1_zero(sequences, queries, responses):
     rewards = []
     for sequence in sequences:
         try:
@@ -121,7 +76,7 @@ def qwen_math_equal_subprocess(prediction, reference,  timeout_seconds=10):
         return False
 
 
-def get_reward_qwen_math(sequences):
+def get_reward_qwen_math(sequences, queries, responses):
     rewards = []
     for sequence in sequences:
         try:
@@ -159,22 +114,21 @@ def get_reward_qwen_math(sequences):
     return rewards
 
 
-def get_reward(sequences):
+
+def get_reward(sequences, queries, responses):
     """
     reward: 1 if the answer is correct, -1 if the answer is incorrect, -100 if the answer is invalid
     """
     rewards = []
-    for sequence in sequences:
+    for q, response in zip(queries, responses):
         try:
-            q, a = sequence.split("Answer:")
-            q = re.sub(r"Question:", "", q).strip()
-            a = a.strip()
+            q = q.split('Answer:')[0].strip().split('Question:')[-1].strip()
             v = answer_dict.get(q, None)
             if v is None:
                 rewards.append(-1)
                 continue
             ref, data_type = v["ref"], v["type"]
-            hyp = extract_answer(a, data_type)
+            hyp = extract_answer(response, data_type)
             if hyp == "[INVALID]":
                 rewards.append(-1)
                 print((hyp, ref, rewards[-1]))
@@ -192,19 +146,21 @@ def get_reward(sequences):
 app = FastAPI()
 
 class InputText(BaseModel):
+    sequence: List[str]
     query: List[str]
+    response: List[str]
 
 class OutputPrediction(BaseModel):
     rewards: List[float]
 
 @app.post("/predict", response_model=OutputPrediction)
 async def predict(input_text: InputText):
-    return {"rewards": get_reward(input_text.query)}
+    return {"rewards": get_reward(input_text.sequence, input_text.query, input_text.response)}
 
 @app.post("/predict_r1_zero", response_model=OutputPrediction)
 async def predict(input_text: InputText):
-    return {"rewards": get_reward_r1_zero(input_text.query)}
+    return {"rewards": get_reward_r1_zero(input_text.sequence, input_text.query, input_text.response)}
 
 @app.post("/predict_qwen_math", response_model=OutputPrediction)
 async def predict(input_text: InputText):
-    return {"rewards": get_reward_qwen_math(input_text.query)}
+    return {"rewards": get_reward_qwen_math(input_text.sequence, input_text.query, input_text.response)}

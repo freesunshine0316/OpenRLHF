@@ -16,6 +16,7 @@ from openrlhf.utils.distributed_sampler import DistributedSampler
 from openrlhf.trainer.ppo_utils import AdaptiveKLController, Experience, FixedKLController, NaiveReplayBuffer
 from openrlhf.trainer.ppo_utils.experience_maker import NaiveExperienceMaker
 from openrlhf.models.actor import Actor
+from loguru import logger
 
 class PPOTrainer(ABC):
     """
@@ -240,16 +241,22 @@ class PPOTrainer(ABC):
                 torch.cuda.empty_cache()
                 self.replay_buffer.normalize("advantages", self.strategy)
                 status = self.ppo_train(steps)
+                logger.info(f"before clear")
                 self.replay_buffer.clear()
+                logger.info(f"after clear")
                 torch.cuda.empty_cache()
+                logger.info(f"after empty_cache")
 
                 if "kl" in status:
                     self.kl_ctl.update(status["kl"], args.rollout_batch_size * args.n_samples_per_prompt)
+                logger.info(f"after external kl")
                 pbar.set_postfix(status)
+                logger.info(f"after external set_postfix")
 
                 # logs/checkpoints
                 client_states = {"consumed_samples": steps * args.rollout_batch_size}
                 self.save_logs_and_checkpoints(args, steps, pbar, status, client_states)
+                logger.info(f"after save_logs_and_checkpoints")
 
                 pbar.update()
                 steps = steps + 1
@@ -293,10 +300,12 @@ class PPOTrainer(ABC):
 
                 # for DP
                 # weighted mean for kl
+                logger.info(f"after training_step")
                 if "kl" in status:
                     status["kl"] *= status["response_length"]
                     status = self.strategy.all_reduce(status)
                     status["kl"] /= status["response_length"]
+                logger.info(f"after kl")
 
                 short_status = {}
 
@@ -321,6 +330,7 @@ class PPOTrainer(ABC):
 
                 status_list.append(status)
                 pbar.set_postfix(short_status)
+                logger.info(f"after set_postfix")
 
         if status_list:
             status_mean = status_list[0]
@@ -329,6 +339,7 @@ class PPOTrainer(ABC):
                     status_mean[k] += v
             for k in status_mean.keys():
                 status_mean[k] /= len(status_list)
+        logger.info(f"after status_list")
         return status_mean
 
     def training_step(self, experience: Experience, global_steps) -> Dict[str, float]:

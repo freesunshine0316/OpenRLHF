@@ -1,10 +1,11 @@
-POLICY=/apdcephfs_sh2/share_300000800/user/antewang/ppo/OpenRLHF-0.5.6/Qwen2.5-Math-1.5B_sft_star
-CRITIC=/apdcephfs_sh2/share_300000800/user/antewang/ppo/OpenRLHF-0.5.6/Qwen2.5-Math-1.5B_sft_value
-OUTPUT=/apdcephfs/share_300000800/user/lfsong/exp.tencent_chat/output/Qwen2.5-Math-1.5B_gsm8k_math_ppo_vote_fp32
+POLICY=/apdcephfs_qy3/share_301812049/oakyu/exp.tencent_chat/models/Qwen2.5-Math-1.5B_sft_star
+CRITIC=/apdcephfs_qy3/share_301812049/oakyu/exp.tencent_chat/models/Qwen2.5-Math-1.5B_sft_value
 
-SCRIPT_DIR="/apdcephfs/share_300000800/user/lfsong/exp.tencent_chat/hunyuan-prover/mcts_search/train"
+NAME=naive_fp32
+OUTPUT=/apdcephfs_qy3/share_301812049/oakyu/exp.tencent_chat/OpenRLHF/output/Qwen2.5-Math-1.5B_gsm8k_math_ppo/${NAME}
+TENSORBOARD=/apdcephfs_qy3/share_301812049/oakyu/exp.tencent_chat/OpenRLHF/tensorboard/Qwen2.5-Math-1.5B_gsm8k_math_ppo/${NAME}
 
-deepspeed ${SCRIPT_DIR}/train_ppo.py \
+deepspeed --module openrlhf.cli.train_ppo \
   --pretrain ${POLICY} \
   --critic_pretrain ${CRITIC} \
   --remote_rm_url http://localhost:1234/predict \
@@ -27,12 +28,15 @@ deepspeed ${SCRIPT_DIR}/train_ppo.py \
   --prompt_data dataset/train_gsm8k_math.jsonl \
   --input_key input \
   --max_samples 100000 \
-  --normalize_reward \
   --adam_offload \
   --gradient_checkpointing \
-  --search_algo bestofn
+  --search_algo sampling \
+  --n_samples_per_prompt 1 \
+  --use_tensorboard ${TENSORBOARD}
 
 python3 occupy_heavy.py
+
+# --search_algo bestofn
 
 # --bf16 \
 # --grad_accum_dtype fp32 \
