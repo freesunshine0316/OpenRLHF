@@ -130,7 +130,7 @@ def train(args):
         train_split=args.prompt_split,
     )
     prompts_data = prompts_data.select(range(min(args.max_samples, len(prompts_data))))
-    prompts_dataset = PromptDataset(prompts_data, tokenizer, strategy, input_template=args.input_template)
+    prompts_dataset = PromptDataset(prompts_data, tokenizer, strategy, max_length=args.prompt_max_len, input_template=args.input_template)
 
     if args.pretrain_data:
         pretrain_data = blending_datasets(
@@ -245,6 +245,7 @@ def train(args):
         prompt_max_len=args.prompt_max_len,
         value_clip=args.value_clip,
         eps_clip=args.eps_clip,
+        dual_clip=args.dual_clip,
         gamma=args.gamma,
         lambd=args.lambd,
         init_kl_coef=args.init_kl_coef,
@@ -252,6 +253,7 @@ def train(args):
         ema_beta=0.992,
         ptx_coef=args.ptx_coef,
         max_norm=args.max_norm,
+        freeze_critic=args.freeze_critic,
         # fro GPT generation
         search_algo=args.search_algo,
         do_sample=True,
@@ -263,6 +265,7 @@ def train(args):
         eos_token_id=tokenizer.eos_token_id,
         # remote reward model
         remote_rm_url=args.remote_rm_url,
+        enable_test_memory_mode=args.enable_test_memory_mode,
     )
 
     trainer.fit(args, prompts_dataloader, pretrain_dataloader, consumed_samples, num_update_steps_per_episodes)
@@ -287,6 +290,8 @@ if __name__ == "__main__":
     # custom
     parser.add_argument("--search_algo", type=str, default="sampling",
                         choices=['sampling', 'beamsearch', 'litesearch', 'bestofn'])
+    parser.add_argument("--freeze_critic", action="store_true", default=False)
+    parser.add_argument("--enable_test_memory_mode", action="store_true", default=False)
 
     # Checkpoint
     parser.add_argument("--save_path", type=str, default="./ckpt")
@@ -311,6 +316,7 @@ if __name__ == "__main__":
     parser.add_argument("--l2", type=float, default=0.0, help="weight decay loss")
     parser.add_argument("--ptx_coef", type=float, default=0.05, help="PPO-ptx loss coef")
     parser.add_argument("--eps_clip", type=float, default=0.2, help="PPO clip range")
+    parser.add_argument("--dual_clip", action="store_true", default=False)
     parser.add_argument("--value_clip", type=float, default=0.2, help="PPO value clip range")
     parser.add_argument("--lambd", type=float, default=0.95, help="PPO GAE lambd")
     parser.add_argument("--gamma", type=float, default=1, help="PPO GAE gamma")
@@ -362,7 +368,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--advantage_estimator",
         type=str,
-        choices=["gae", "reinforce", "rloo"],
+        choices=["gae", "reinforce", "rloo", "grpo"],
         default="gae",
         help="Choose advantage estimation method: gae, reinforce, rloo",
     )
@@ -420,13 +426,13 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if args.advantage_estimator not in ["gae"]:
+    if args.advantage_estimator not in ["gae"] and args.search_algo == "sampling":
         args.critic_pretrain = None
-    elif args.critic_pretrain is None:
-        if not args.remote_rm_url:
-            args.critic_pretrain = args.reward_pretrain
-        else:
-            args.critic_pretrain = args.pretrain
+    # elif args.critic_pretrain is None:
+    #     if not args.remote_rm_url:
+    #         args.critic_pretrain = args.reward_pretrain
+    #     else:
+    #         args.critic_pretrain = args.pretrain
 
     if args.advantage_estimator == "rloo":
         assert args.n_samples_per_prompt > 1, "RLOO requires n_samples_per_prompt > 1"

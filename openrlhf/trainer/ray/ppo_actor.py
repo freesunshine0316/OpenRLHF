@@ -281,7 +281,7 @@ class ActorModelRayActor(BasePPORole):
         )
         prompts_data = prompts_data.select(range(min(args.max_samples, len(prompts_data))))
         self.prompts_dataset = PromptDataset(
-            prompts_data, self.tokenizer, strategy, input_template=args.input_template
+            prompts_data, self.tokenizer, strategy, max_length=args.prompt_max_len, input_template=args.input_template
         )
         self.prompts_dataloader = strategy.setup_dataloader(
             self.prompts_dataset, args.rollout_batch_size // strategy.world_size, True, True
@@ -366,6 +366,7 @@ class ActorModelRayActor(BasePPORole):
             prompt_max_len=args.prompt_max_len,
             value_clip=args.value_clip,
             eps_clip=args.eps_clip,
+            dual_clip=args.dual_clip,
             gamma=args.gamma,
             lambd=args.lambd,
             init_kl_coef=args.init_kl_coef,
@@ -373,6 +374,7 @@ class ActorModelRayActor(BasePPORole):
             ema_beta=0.992,
             ptx_coef=args.ptx_coef,
             max_norm=args.max_norm,
+            freeze_critic=args.freeze_critic,
             # fro GPT generation
             search_algo=args.search_algo,
             do_sample=True,
@@ -382,6 +384,7 @@ class ActorModelRayActor(BasePPORole):
             top_p=args.top_p,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
+            enable_test_memory_mode=args.enable_test_memory_mode,
         )
 
         # broadcast checkpoint

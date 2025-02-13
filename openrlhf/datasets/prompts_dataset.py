@@ -30,7 +30,9 @@ class PromptDataset(Dataset):
         dataset,
         tokenizer,
         strategy,
+        max_length,
         input_template=None,
+        is_filter=True,
     ) -> None:
         super().__init__()
         self.strategy = strategy
@@ -47,6 +49,9 @@ class PromptDataset(Dataset):
         self.prompts = []
         for data in tqdm(dataset, desc="Preprocessing data", disable=not self.strategy.is_rank_0()):
             prompt = preprocess_data(data, input_template, input_key, apply_chat_template)
+            if is_filter:
+                if len(tokenizer.encode(prompt, add_special_tokens=False)) > max_length:
+                    continue
             self.prompts.append(prompt)
 
     def __len__(self):

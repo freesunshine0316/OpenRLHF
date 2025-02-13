@@ -121,6 +121,7 @@ class Samples:
     input_length: int
     response_length: torch.Tensor
     total_length: torch.Tensor
+    all_sequences: Optional[torch.Tensor] = None
 
 
 class NaiveExperienceMaker(ABC):
@@ -176,7 +177,7 @@ class NaiveExperienceMaker(ABC):
         return {k: v.to(device) for k, v in batch.items()}
 
     @torch.no_grad()
-    def make_experience_list(self, all_prompts: Union[str, List[str]], search_algo: str, **generate_kwargs) -> List[Experience]:
+    def make_experience_list(self, all_prompts: Union[str, List[str]], search_algo: str, enable_test_memory_mode: bool, **generate_kwargs) -> List[Experience]:
         """
         Make a list of experience with the micro_rollout_batch_size.
 
@@ -187,9 +188,9 @@ class NaiveExperienceMaker(ABC):
         args = self.strategy.args
         # generate responses
         if search_algo == "sampling":
-            samples_list = self.generate_samples(all_prompts, **generate_kwargs)
+            samples_list = self.generate_samples(all_prompts, enable_test_memory_mode, **generate_kwargs)
         else:
-            samples_list = self.search_samples(all_prompts, search_algo, **generate_kwargs)
+            samples_list = self.search_samples(all_prompts, search_algo, enable_test_memory_mode, **generate_kwargs)
         torch.distributed.barrier()
         experiences = []
         for samples in tqdm(
@@ -197,7 +198,7 @@ class NaiveExperienceMaker(ABC):
             desc="make_experience",
             disable=not self.strategy.is_rank_0(),
         ):
-            experiences.append(self.make_experience(samples).to_device("cpu"))
+            experiences.append(self.make_experience(samples).to_device("cpu")) # size of each samples: if `sampling': args.micro_rollout_batch_size; else: 1
 
         experiences, rewards = self.process_experiences(experiences)
 
@@ -206,32 +207,38 @@ class NaiveExperienceMaker(ABC):
             experience = experience.to_device("cuda")
             reward = reward.to(device="cuda")
             num_actions = experience.info["num_actions"]
-            reward = compute_reward(
-                reward,
-                self.kl_ctl.value,
-                experience.kl,
-                action_mask=experience.action_mask,
-                num_actions=num_actions,
-                reward_clip_range=args.reward_clip_range,
-            )
-
-            if self.advantage_estimator == "gae":
-                experience.advantages, experience.returns = self.get_advantages_and_returns(
-                    experience.values,
-                    reward,
-                    experience.action_mask,
-                    generate_kwargs["gamma"],
-                    generate_kwargs["lambd"],
-                )
-            elif self.advantage_estimator in ["reinforce", "rloo"]:
-                experience.returns = self.get_cumulative_returns(
-                    reward,
-                    experience.action_mask,
-                    generate_kwargs["gamma"],
-                )
-                experience.advantages = deepcopy(experience.returns)
+        
+            if self.advantage_estimator == "grpo":
+                reward = reward[:, None].expand_as(experience.action_log_probs)
+                experience.advantages = reward
+                experience.returns = experience.advantages
             else:
-                raise Exception(f"Unkown advantage_estimator {self.advantage_estimator}")
+                reward = compute_reward(
+                    reward,
+                    self.kl_ctl.value,
+                    experience.kl,
+                    action_mask=experience.action_mask,
+                    num_actions=num_actions,
+                    reward_clip_range=args.reward_clip_range,
+                )
+
+                if self.advantage_estimator == "gae":
+                    experience.advantages, experience.returns = self.get_advantages_and_returns(
+                        experience.values,
+                        reward,
+                        experience.action_mask,
+                        generate_kwargs["gamma"],
+                        generate_kwargs["lambd"],
+                    )
+                elif self.advantage_estimator in ["reinforce", "rloo"]:
+                    experience.returns = self.get_cumulative_returns(
+                        reward,
+                        experience.action_mask,
+                        generate_kwargs["gamma"],
+                    )
+                    experience.advantages = deepcopy(experience.returns)
+                else:
+                    raise Exception(f"Unkown advantage_estimator {self.advantage_estimator}")
 
             # calculate the return info.
             if not getattr(self, "packing_samples", False):
@@ -241,14 +248,17 @@ class NaiveExperienceMaker(ABC):
                     [each_reward.sum() for each_reward in reward], device=torch.cuda.current_device()
                 )
             experience.info["return"] = return_sums
-            # remove unnecessary info
-            experience.kl = None
+            if self.advantage_estimator == "grpo":
+                experience.kl = -self.kl_ctl.value * (torch.exp(-experience.kl) + experience.kl - 1)
+            else:
+                # remove unnecessary info
+                experience.kl = None
             del experience.info["num_actions"]
             experience.to_device("cpu")
         return experiences
 
     @torch.no_grad()
-    def generate_samples(self, all_prompts: List[str], **generate_kwargs) -> List[Samples]:
+    def generate_samples(self, all_prompts: List[str], enable_test_memory_mode: bool, **generate_kwargs) -> List[Samples]:
         """
         Generate samples and return in batches.
         """
@@ -261,7 +271,13 @@ class NaiveExperienceMaker(ABC):
 
         for i in range(0, len(all_prompts), args.micro_rollout_batch_size):
             prompts = all_prompts[i : i + args.micro_rollout_batch_size]
-            inputs = self.tokenize_fn(prompts, self.prompt_max_len, device="cuda")
+            if enable_test_memory_mode:
+                input_ids = torch.randint(4, 100, (len(prompts), self.prompt_max_len)).to("cuda")
+                attention_mask = torch.ones_like(input_ids)
+                inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
+                generate_kwargs["min_new_tokens"] = generate_kwargs["max_new_tokens"]
+            else:
+                inputs = self.tokenize_fn(prompts, self.prompt_max_len, device="cuda")
             sequences, attention_mask, action_mask = self.actor.generate(**inputs, **generate_kwargs)
             samples = Samples(
                 sequences=sequences,
@@ -278,64 +294,47 @@ class NaiveExperienceMaker(ABC):
         return samples_list
 
     @torch.no_grad()
-    def search_samples(self, all_prompts: List[str], search_algo: str, **generate_kwargs) -> List[Samples]:
+    def search_samples(self, all_prompts: List[str], search_algo: str, enable_test_memory_mode: bool, **generate_kwargs) -> List[Samples]:
         """
         Search samples using tree search algorithms and return in batches.
         """
         assert not getattr(self, "packing_samples", False)
         args = self.strategy.args
         self.actor.eval()
-        self.critic.eval()
+        if self.critic is not None:
+            self.critic.eval()
         samples_list = []
         
-        _all_trajs = []
-        _all_prompts = []
         for prompt in all_prompts:
             if search_algo == "beamsearch":
+                raise NotImplementedError
                 sequences = beamsearch(prompt, actor=self.actor, critic=self.critic, tokenizer=self.tokenizer)
+                all_sequences = None
             elif search_algo == "litesearch":
+                raise NotImplementedError
                 sequences = litesearch(prompt, actor=self.actor, critic=self.critic, tokenizer=self.tokenizer)
+                all_sequences = None
             elif search_algo == "bestofn":
-                sequences = bestofn(prompt, actor=self.actor, critic=self.critic, tokenizer=self.tokenizer)
+                sequences, all_sequences = bestofn(prompt, actor=self.actor, critic=self.critic, tokenizer=self.tokenizer, n_samples_per_prompt=args.n_samples_per_prompt, prompt_max_len=self.prompt_max_len, enable_test_memory_mode=enable_test_memory_mode, **generate_kwargs)
             else:
                 raise Exception(f"Unknown search algorithm {search_algo}")
-            _all_trajs += [seq[len(prompt):] for seq in sequences]
-            _all_prompts += [prompt] * len(sequences)
-        # shuffle prompt and traj
-        shuffle_indices = list(range(len(_all_prompts)))
-        random.shuffle(shuffle_indices)
-        _all_prompts = [_all_prompts[i] for i in shuffle_indices]
-        _all_trajs = [_all_trajs[i] for i in shuffle_indices]
-        # we should control the batch size, elif raise exception
-        # it is hard to control, an easy way is to get enough trajs and ensure the requirements can be met
-        for i in range(0, min(len(all_prompts), len(_all_prompts)), args.micro_rollout_batch_size):
-            prompts = _all_prompts[i: i + args.micro_rollout_batch_size]
-            trajs = _all_trajs[i: i + args.micro_rollout_batch_size]
-            prompt_ids = self.tokenize_fn(prompts, self.prompt_max_len, device="cuda")
-            traj_ids = self.tokenizer(
-                        trajs,
-                        return_tensors="pt",
-                        add_special_tokens=False,
-                        max_length=generate_kwargs["max_length"],
-                        padding=True,
-                        truncation=True,
-                        padding_side="right"
-                    )
-            traj_ids = {k: v.to("cuda") for k, v in traj_ids.items()}
-            sequences = {k: torch.concatenate([v, traj_ids[k]], dim=-1) for k, v in prompt_ids.items()}
-            sequences = sequences["input_ids"]
-            sequences, attention_mask, action_mask = self.actor.process_sequences(sequences, prompt_ids["input_ids"].size(1), self.tokenizer.pad_token_id, self.tokenizer.eos_token_id)
-            samples = Samples(
-                sequences=sequences,
-                attention_mask=attention_mask,
-                action_mask=action_mask,
-                num_actions=action_mask.size(1),
-                packed_seq_lens=None,
-                input_length=prompt_ids["input_ids"].size(1),
-                response_length=action_mask.float().sum(dim=-1),
-                total_length=attention_mask.float().sum(dim=-1),
-            )
-            samples_list.append(samples)
+
+            prompt_ids = self.tokenize_fn([prompt], self.prompt_max_len, device="cuda")
+            all_sequences, _, _ = self.actor.process_sequences(all_sequences, prompt_ids["input_ids"].size(1), self.tokenizer.pad_token_id, self.tokenizer.eos_token_id)
+            for seq in sequences:
+                seq, attention_mask, action_mask = self.actor.process_sequences(seq.unsqueeze(0), prompt_ids["input_ids"].size(1), self.tokenizer.pad_token_id, self.tokenizer.eos_token_id)
+                samples = Samples(
+                    sequences=seq,
+                    attention_mask=attention_mask,
+                    action_mask=action_mask,
+                    num_actions=action_mask.size(1),
+                    packed_seq_lens=None,
+                    input_length=prompt_ids["input_ids"].size(1),
+                    response_length=action_mask.float().sum(dim=-1),
+                    total_length=attention_mask.float().sum(dim=-1),
+                    all_sequences=all_sequences,
+                )
+                samples_list.append(samples)
         return samples_list
 
     @torch.no_grad()
@@ -376,10 +375,19 @@ class NaiveExperienceMaker(ABC):
             responses = self.tokenizer.batch_decode(sequences[:, input_length:].cpu(), skip_special_tokens=True)
             queries = self.tokenizer.batch_decode(sequences[:, :input_length].cpu(), skip_special_tokens=True)
             r = remote_rm_fn(self.remote_rm_url, sequences=seqs, queries=queries, responses=responses).to(device=action_log_probs.device)
+            ar = None
+            if samples.all_sequences is not None:
+                seqs = self.tokenizer.batch_decode(samples.all_sequences.cpu(), skip_special_tokens=True)
+                responses = self.tokenizer.batch_decode(samples.all_sequences[:, input_length:].cpu(), skip_special_tokens=True)
+                queries = self.tokenizer.batch_decode(samples.all_sequences[:, :input_length].cpu(), skip_special_tokens=True)
+                ar = remote_rm_fn(self.remote_rm_url, sequences=seqs, queries=queries, responses=responses).to(device=action_log_probs.device)
             # r = torch.clamp(r, min=-1, max=1).to(torch.float)
         else:
             # local RM
             r = self.reward_model(sequences, attention_mask)
+            ar = None
+            if samples.all_sequences is not None:
+                ar = self.reward_model(samples.all_sequences, attention_mask)
 
         # DEBUG
         # import random
@@ -398,6 +406,7 @@ class NaiveExperienceMaker(ABC):
             "response_length": samples.response_length,
             "total_length": samples.total_length,
             "num_actions": num_actions,
+            **({"all_reward": ar} if ar is not None else {})
         }
         # reset model state
         self.actor.train()
@@ -433,6 +442,25 @@ class NaiveExperienceMaker(ABC):
             baseline = (rewards.sum(-1, keepdim=True) - rewards) / (args.n_samples_per_prompt - 1)
             rewards = rewards - baseline
             rewards = rewards.flatten().to(device="cpu").chunk(len(experiences))
+            return experiences, rewards
+        # reward shaping for GRPO
+        elif args.advantage_estimator == "grpo":
+            n_prompt = args.rollout_batch_size // self.strategy.world_size
+            rewards = torch.cat([experience.info["reward"] for experience in experiences])
+            rewards = rewards.reshape((n_prompt, -1))
+            if experiences[0].info.get("all_reward", None) is not None:
+                n_sample_per_prompt = len(experiences) // n_prompt
+                all_rewards = torch.cat([experience.info["all_reward"] for experience in experiences[0: len(experiences): n_sample_per_prompt]])
+                all_rewards = all_rewards.reshape((n_prompt, -1))
+                means = [reward.mean() if len(reward.unique()) > 1 else 0 for reward in all_rewards]
+                stds = [reward.std() if len(reward.unique()) > 1 else 1 for reward in all_rewards]
+                for exp in experiences:
+                    del exp.info["all_reward"]
+            else:
+                means = [reward.mean() if len(reward.unique()) > 1 else 0 for reward in rewards]
+                stds = [reward.std() if len(reward.unique()) > 1 else 1 for reward in rewards]
+            rewards = torch.stack([(reward - mean) / std for reward, mean, std in zip(rewards, means, stds)], dim=0)
+            rewards = rewards.view((-1,)).chunk(len(experiences))
             return experiences, rewards
         # default rewards
         return experiences, [experience.info["reward"] for experience in experiences]
@@ -547,14 +575,14 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         self.packing_samples = packing_samples
 
     @torch.no_grad()
-    def make_experience_list(self, all_prompts: Union[str, List[str]], search_algo: str, **generate_kwargs) -> List[Experience]:
+    def make_experience_list(self, all_prompts: Union[str, List[str]], search_algo: str, enable_test_memory_mode: bool, **generate_kwargs) -> List[Experience]:
         if self.strategy.args.perf:
             self.perf_stats = {
                 "generate_time": 0,
                 "actor_value_rm_time": 0,
                 "wait_time": 0,
             }
-        experiences = super().make_experience_list(all_prompts, search_algo, **generate_kwargs)
+        experiences = super().make_experience_list(all_prompts, search_algo, enable_test_memory_mode, **generate_kwargs)
         if self.critic is not None:
             for experience in experiences:
                 # send experience to critic
@@ -564,7 +592,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         return experiences
 
     @torch.no_grad()
-    def generate_samples(self, all_prompts: List[str], **generate_kwargs) -> List[Samples]:
+    def generate_samples(self, all_prompts: List[str], enable_test_memory_mode: bool, **generate_kwargs) -> List[Samples]:
         """
         Generate samples and return in batches.
 
@@ -572,9 +600,9 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         in which actor will be used to generate samples.
         """
         if self.vllm_engines is None:
-            return super().generate_samples(all_prompts, **generate_kwargs)
+            return super().generate_samples(all_prompts, enable_test_memory_mode, **generate_kwargs)
 
-        return self._generate_vllm(all_prompts, **generate_kwargs)
+        return self._generate_vllm(all_prompts, enable_test_memory_mode, **generate_kwargs)
 
     @torch.no_grad()
     def make_experience(self, samples: Samples) -> Experience:
@@ -717,7 +745,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         self.actor.train()  # reset model state
         return experience
 
-    def _generate_vllm(self, all_prompts: List[str], **kwargs) -> List[Samples]:
+    def _generate_vllm(self, all_prompts: List[str], enable_test_memory_mode: bool, **kwargs) -> List[Samples]:
         from vllm import SamplingParams
 
         # round-robin load balance
@@ -745,6 +773,9 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         # Expand prompt list based on the number of samples per prompt
         all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
         all_prompt_token_ids = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)["input_ids"]
+        if enable_test_memory_mode:
+            all_prompt_token_ids = torch.randint(4, 100, (len(all_prompts), self.prompt_max_len)).tolist()
+            sampling_params.min_tokens = sampling_params.max_tokens
 
         # Distribute requests to engines and collect responses to outputs
         all_output_refs = []

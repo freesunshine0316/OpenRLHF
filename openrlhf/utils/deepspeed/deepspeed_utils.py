@@ -46,6 +46,7 @@ def get_train_ds_config(
             "enabled": bf16,
         },
         "gradient_clipping": max_norm,
+        "communication_data_type": 'fp32',
         "prescale_gradients": False,
         "wall_clock_breakdown": False,
         "data_types": {"grad_accum_dtype": grad_accum_dtype},

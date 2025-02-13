@@ -16,7 +16,6 @@ from openrlhf.utils.distributed_sampler import DistributedSampler
 from openrlhf.trainer.ppo_utils import AdaptiveKLController, Experience, FixedKLController, NaiveReplayBuffer
 from openrlhf.trainer.ppo_utils.experience_maker import NaiveExperienceMaker
 from openrlhf.models.actor import Actor
-from loguru import logger
 
 class PPOTrainer(ABC):
     """
@@ -76,6 +75,7 @@ class PPOTrainer(ABC):
         buffer_limit: int = 0,
         buffer_cpu_offload: bool = True,
         eps_clip: float = 0.2,
+        dual_clip: bool = False,
         value_clip: float = 0.2,
         micro_rollout_batch_size: int = 8,
         gradient_checkpointing: bool = False,
@@ -87,6 +87,8 @@ class PPOTrainer(ABC):
         remote_rm_url: str = None,
         reward_fn: Callable[[List[torch.Tensor]], torch.Tensor] = None,
         search_algo: str = "sampling",
+        freeze_critic: Optional[bool] = False,
+        enable_test_memory_mode: Optional[bool] = False,
         **generate_kwargs,
     ) -> None:
         assert (
@@ -96,6 +98,8 @@ class PPOTrainer(ABC):
         super().__init__()
 
         self.search_algo = search_algo
+        self.freeze_critic = freeze_critic
+        self.enable_test_memory_mode = enable_test_memory_mode
 
         self.strategy = strategy
         self.args = strategy.args
@@ -124,7 +128,7 @@ class PPOTrainer(ABC):
         self.actor_scheduler = actor_scheduler
         self.critic_scheduler = critic_scheduler
 
-        self.actor_loss_fn = PolicyLoss(eps_clip)
+        self.actor_loss_fn = PolicyLoss(eps_clip, dual_clip=dual_clip)
         self.critic_loss_fn = ValueLoss(value_clip)
         self.ptx_loss_fn = GPTLMLoss()
 
@@ -229,7 +233,7 @@ class PPOTrainer(ABC):
 
             for rand_prompts in self.prompts_dataloader:
                 for i, experience in enumerate(
-                    self.experience_maker.make_experience_list(rand_prompts, self.search_algo, **self.generate_kwargs)
+                    self.experience_maker.make_experience_list(rand_prompts, self.search_algo, self.enable_test_memory_mode, **self.generate_kwargs)
                 ):
                     if i == 0:
                         output = self.tokenizer.batch_decode(
@@ -239,24 +243,19 @@ class PPOTrainer(ABC):
                     self.replay_buffer.append(experience)
 
                 torch.cuda.empty_cache()
-                self.replay_buffer.normalize("advantages", self.strategy)
+                if args.advantage_estimator != 'grpo':
+                    self.replay_buffer.normalize("advantages", self.strategy)
                 status = self.ppo_train(steps)
-                logger.info(f"before clear")
                 self.replay_buffer.clear()
-                logger.info(f"after clear")
                 torch.cuda.empty_cache()
-                logger.info(f"after empty_cache")
 
                 if "kl" in status:
                     self.kl_ctl.update(status["kl"], args.rollout_batch_size * args.n_samples_per_prompt)
-                logger.info(f"after external kl")
                 pbar.set_postfix(status)
-                logger.info(f"after external set_postfix")
 
                 # logs/checkpoints
                 client_states = {"consumed_samples": steps * args.rollout_batch_size}
                 self.save_logs_and_checkpoints(args, steps, pbar, status, client_states)
-                logger.info(f"after save_logs_and_checkpoints")
 
                 pbar.update()
                 steps = steps + 1
@@ -300,12 +299,10 @@ class PPOTrainer(ABC):
 
                 # for DP
                 # weighted mean for kl
-                logger.info(f"after training_step")
                 if "kl" in status:
                     status["kl"] *= status["response_length"]
                     status = self.strategy.all_reduce(status)
                     status["kl"] /= status["response_length"]
-                logger.info(f"after kl")
 
                 short_status = {}
 
@@ -330,7 +327,6 @@ class PPOTrainer(ABC):
 
                 status_list.append(status)
                 pbar.set_postfix(short_status)
-                logger.info(f"after set_postfix")
 
         if status_list:
             status_mean = status_list[0]
@@ -339,14 +335,13 @@ class PPOTrainer(ABC):
                     status_mean[k] += v
             for k in status_mean.keys():
                 status_mean[k] /= len(status_list)
-        logger.info(f"after status_list")
         return status_mean
 
     def training_step(self, experience: Experience, global_steps) -> Dict[str, float]:
         status = {}
         if global_steps > self.freezing_actor_steps:
             status = self.training_step_actor(experience)
-        if self.critic is not None:
+        if self.critic is not None and not self.freeze_critic:
             status.update(self.training_step_critic(experience))
         return status
 
@@ -385,6 +380,7 @@ class PPOTrainer(ABC):
             action_log_probs,
             old_action_log_probs,
             advantages,
+            kl=experience.kl if self.strategy.args.advantage_estimator == 'grpo' else None,
             action_mask=experience.action_mask,
         )
         # mixtral

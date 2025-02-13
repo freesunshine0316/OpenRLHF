@@ -180,6 +180,8 @@ if __name__ == "__main__":
     # custom
     parser.add_argument("--search_algo", type=str, default="sampling",
                         choices=['sampling', 'beamsearch', 'litesearch', 'bestofn'])
+    parser.add_argument("--freeze_critic", action="store_true", default=False)
+    parser.add_argument("--enable_test_memory_mode", action="store_true", default=False)
 
     # Ray and vLLM
     parser.add_argument("--ref_num_nodes", type=int, default=1, help="number of nodes for reference")
@@ -269,6 +271,7 @@ if __name__ == "__main__":
     parser.add_argument("--l2", type=float, default=0.0, help="weight decay loss")
     parser.add_argument("--ptx_coef", type=float, default=0.05, help="PPO-ptx loss coef")
     parser.add_argument("--eps_clip", type=float, default=0.2, help="PPO clip range")
+    parser.add_argument("--dual_clip", action="store_true", default=False)
     parser.add_argument("--value_clip", type=float, default=0.2, help="PPO value clip range")
     parser.add_argument("--lambd", type=float, default=0.95, help="PPO GAE lambd")
     parser.add_argument("--gamma", type=float, default=1, help="PPO GAE gamma")
@@ -305,7 +308,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--advantage_estimator",
         type=str,
-        choices=["gae", "reinforce", "rloo"],
+        choices=["gae", "reinforce", "rloo", "grpo"],
         default="gae",
         help="Choose advantage estimation method: gae, reinforce, rloo",
     )
@@ -361,13 +364,13 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if args.advantage_estimator not in ["gae"]:
+    if args.advantage_estimator not in ["gae"] and args.search_algo == "sampling":
         args.critic_pretrain = None
-    elif args.critic_pretrain is None:
-        if not args.remote_rm_url:
-            args.critic_pretrain = args.reward_pretrain.split(",")[0]
-        else:
-            args.critic_pretrain = args.pretrain
+    # elif args.critic_pretrain is None:
+    #     if not args.remote_rm_url:
+    #         args.critic_pretrain = args.reward_pretrain.split(",")[0]
+    #     else:
+    #         args.critic_pretrain = args.pretrain
 
     if args.advantage_estimator == "rloo":
         assert args.n_samples_per_prompt > 1, "RLOO requires n_samples_per_prompt > 1"

@@ -132,6 +132,7 @@ class Actor(nn.Module):
             "temperature": kwargs.get("temperature", 1),
             "use_cache": True,
             "num_beams": kwargs.get("num_beams", 1),
+            "num_return_sequences": kwargs.get("num_return_sequences", 1),
             "attention_mask": kwargs.get("attention_mask"),
             "eos_token_id": kwargs.get("eos_token_id"),
             "pad_token_id": kwargs.get("pad_token_id"),
