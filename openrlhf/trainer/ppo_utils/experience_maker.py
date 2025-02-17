@@ -15,9 +15,7 @@ from openrlhf.models.utils import compute_approx_kl, compute_reward, masked_mean
 from openrlhf.utils.logging_utils import init_logger
 from openrlhf.utils.remote_rm_utils import remote_rm_fn, remote_rm_fn_ray
 
-from openrlhf.search_algorithm.beamsearch_efficient import search as beamsearch
-from openrlhf.search_algorithm.litesearch import search as litesearch
-from openrlhf.search_algorithm.bestofn import search as bestofn
+from openrlhf.search_algorithm.bestofn_ray import search as bestofn_ray
 
 import random
 
@@ -716,34 +714,53 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
 
         args = self.strategy.args
 
-        sampling_params = SamplingParams(
-            temperature=kwargs.get("temperature", 1.0),
-            top_p=kwargs.get("top_p", 1.0),
-            top_k=kwargs.get("top_k", -1),
-            max_tokens=kwargs.get("max_new_tokens", 1024),
-            min_tokens=kwargs.get("min_new_tokens", 1),
-            skip_special_tokens=kwargs.get("skip_special_tokens", False),
-            include_stop_str_in_output=True,
-            stop=kwargs.get("stop_strings", False),
-            logprobs=5,
-        )
+        if args.search_algo == "sampling":
+            sampling_params = SamplingParams(
+                temperature=kwargs.get("temperature", 1.0),
+                top_p=kwargs.get("top_p", 1.0),
+                top_k=kwargs.get("top_k", -1),
+                max_tokens=kwargs.get("max_new_tokens", 1024),
+                min_tokens=kwargs.get("min_new_tokens", 1),
+                skip_special_tokens=kwargs.get("skip_special_tokens", False),
+                include_stop_str_in_output=True,
+                stop=kwargs.get("stop_strings", False),
+            )
 
-        # Expand prompt list based on the number of samples per prompt
-        all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
-        all_prompt_token_ids = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)["input_ids"]
+            # Expand prompt list based on the number of samples per prompt
+            all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
+            all_prompt_token_ids = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)["input_ids"]
 
-        # Distribute requests to engines and collect responses to outputs
-        all_output_refs = []
-        batch_size = (len(all_prompt_token_ids) + len(llms) - 1) // len(llms)
-        for i, llm in enumerate(llms):
-            prompt_token_ids = all_prompt_token_ids[i * batch_size : (i + 1) * batch_size]
-            if prompt_token_ids:
-                all_output_refs.append(
-                    llm.generate.remote(sampling_params=sampling_params, prompt_token_ids=prompt_token_ids)
-                )
+            # Distribute requests to engines and collect responses to outputs
+            all_output_refs = []
+            batch_size = (len(all_prompt_token_ids) + len(llms) - 1) // len(llms)
+            for i, llm in enumerate(llms):
+                prompt_token_ids = all_prompt_token_ids[i * batch_size : (i + 1) * batch_size]
+                if prompt_token_ids:
+                    all_output_refs.append(
+                        llm.generate.remote(sampling_params=sampling_params, prompt_token_ids=prompt_token_ids)
+                    )
 
-        # Retrieve and combine results from all outputs
-        all_outputs = sum(ray.get(all_output_refs), [])
+            # Retrieve and combine results from all outputs
+            all_outputs = sum(ray.get(all_output_refs), [])
+        else:
+            # search, have not gone through testing!
+            trajs = []
+            for prompt in all_prompts:
+                traj = bestofn_ray(prompt, tokenizer = self.tokenizer, actor = llms)[0]
+                trajs.append(traj)
+            all_prompt_token_ids = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)["input_ids"]
+            all_traj_token_ids = self.tokenize_fn(trajs, 1024, padding=False)["input_ids"] # openrlhf does not pass generate_max_len, wired
+
+            class DummyOutObj:
+                def __init__(self, token_ids):
+                    self.token_ids = token_ids
+
+            class DummyObj:
+                def __init__(self, prompt_token_ids, token_ids):
+                    self.prompt_token_ids = prompt_token_ids
+                    self.outputs = [DummyOutObj(token_ids)]
+            
+            all_outputs = [DummyObj(prompt_token_ids, token_ids) for prompt_token_ids, token_ids in zip(all_prompt_token_ids, all_traj_token_ids)]
 
         samples_list = []
         for i in range(0, len(all_outputs), args.micro_rollout_batch_size):
