@@ -113,7 +113,7 @@ def search(query, tokenizer, actor, critic=None):
         predictions = {}
         ref, data_type = v["ref"], v["type"]
         has_gold = False
-        for traj, score in zip(trajs, scores.tolist()):
+        for traj, score in zip(trajs, cumulative_logprobs.tolist()):
             hyp = extract_answer(clean_eos(traj, tokenizer.eos_token), data_type)
             if hyp == "[INVALID]":
                 continue
@@ -126,5 +126,5 @@ def search(query, tokenizer, actor, critic=None):
                     break
             if not flag:
                 predictions[hyp] = {"score": score, "trajs": [traj]}
-        sorted_trajs = sorted(predictions.values(), key=lambda x: x["score"], reverse=True)
+        sorted_trajs = sorted(predictions.values(), key=lambda x: x["score"] / len(x["trajs"]), reverse=True)
         return [random.choice(sorted_trajs[0]["trajs"])]
