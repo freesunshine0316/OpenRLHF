@@ -544,6 +544,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                 "actor_value_rm_time": 0,
                 "wait_time": 0,
             }
+        generate_kwargs["has_vllm_engines"] = not (self.vllm_engines is None)
         experiences = super().make_experience_list(all_prompts, search_algo, **generate_kwargs)
         if self.critic is not None:
             for experience in experiences:
