@@ -36,7 +36,7 @@ def get_scores(trajs, tokenizer, critic):
     outputs = critic.compute_value(**input_ids, return_dict=False)
     return (torch.clamp(outputs[0].squeeze(), min=-1, max=1) + 1) / 2
 
-def get_full_trajs_vllm(query, tokenizer, llms, **kwargs):
+def get_full_trajs_vllm(all_prompts, tokenizer, llms, **kwargs):
     from vllm import SamplingParams
     sampling_params = SamplingParams(
         temperature=kwargs.get("temperature", DEFAULT_TEMPERATURE),
@@ -48,9 +48,6 @@ def get_full_trajs_vllm(query, tokenizer, llms, **kwargs):
         include_stop_str_in_output=True,
         logprobs = 0,
     )
-
-    # Expand prompt list based on the number of samples per prompt
-    all_prompts = [query] * kwargs.get("search_budget", DEFAULT_N)
     all_prompt_token_ids = tokenizer(all_prompts, add_special_tokens=False, max_length=1024, truncation=True,)["input_ids"]
 
     # Distribute requests to engines and collect responses to outputs
@@ -148,8 +145,12 @@ def search(query, tokenizer, actor, critic, **kwargs):
         else:
             return [random.choice(_sorted_trajs["trajs"]) for _sorted_trajs in sorted_trajs[:2]]
 
-def search_vllm(query, tokenizer, actor, critic=None, **kwargs):
-    trajs, cumulative_logprobs, custom_logprobs = get_full_trajs_vllm(query, tokenizer, actor)
+def search_vllm(queries, tokenizer, actor, critic=None, **kwargs):
+    if not isinstance(queries, list):
+        queries = [queries]
+    # Expand prompt list based on the number of samples per prompt
+    all_prompts = queries * kwargs.get("search_budget", DEFAULT_N)
+    trajs, cumulative_logprobs, custom_logprobs = get_full_trajs_vllm(all_prompts, tokenizer, actor)
     best_idx = np.argmax(np.array(cumulative_logprobs))
     return [trajs[best_idx]]
     
