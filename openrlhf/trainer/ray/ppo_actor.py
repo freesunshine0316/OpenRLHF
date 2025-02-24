@@ -27,6 +27,7 @@ class ActorPPOTrainer(PPOTrainer):
         vllm_engines: List = None,
         remote_rm_url: List[str] = None,
         critic_train_remote: bool = False,
+        freeze_critic: bool = False,
         **kwargs,
     ):
         """PPOTrainer for ray.
@@ -39,6 +40,7 @@ class ActorPPOTrainer(PPOTrainer):
         self.remote_rm_url = remote_rm_url
         self.vllm_engines = vllm_engines
         self.critic_train_remote = critic_train_remote
+        self.freeze_critic = freeze_critic
 
         self.experience_maker = RemoteExperienceMaker(
             self.actor,
@@ -110,7 +112,7 @@ class ActorPPOTrainer(PPOTrainer):
         torch.distributed.barrier()
 
         # 2. triger remote critic model training
-        if self.critic_train_remote:
+        if self.critic_train_remote and not self.freeze_critic:
             critic_status_ref = self.critic.fit.remote()
 
         # 3. actor model training
@@ -125,7 +127,7 @@ class ActorPPOTrainer(PPOTrainer):
             status = {}
 
         # 5. wait remote critic model training done
-        if self.critic_train_remote:
+        if self.critic_train_remote and not self.freeze_critic:
             status.update(ray.get(critic_status_ref))
         torch.distributed.barrier()
 

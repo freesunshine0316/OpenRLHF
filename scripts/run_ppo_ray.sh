@@ -1,22 +1,31 @@
 
+export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
 if [ -e /apdcephfs_qy3 ]; then
     WORKSPACE=/apdcephfs_qy3/share_301812049/oakyu/exp.tencent_chat
 else
     WORKSPACE=/apdcephfs/share_300000800/user/oakyu/exp.tencent_chat
 fi
 
-POLICY=${WORKSPACE}/models/Qwen2.5-Math-7B_star_MATH_1k
-
-NAME=naive_bf16_t0.6_tp0.95_grpo
-OUTPUT=${WORKSPACE}/OpenRLHF/output/Qwen2.5-Math-7B_MATH_ppo/${NAME}
-TENSORBOARD=${WORKSPACE}/OpenRLHF/tensorboard/Qwen2.5-Math-7B_MATH_ppo/${NAME}
-
 set -x 
 
 MEGATRON_REPO=${WORKSPACE}/OpenRLHF/
 export PYTHONPATH=${MEGATRON_REPO}:$PYTHONPATH
+ray start --head --node-ip-address 0.0.0.0 --num-gpus 8
 
 
+
+
+POLICY=${WORKSPACE}/models/Qwen2.5-Math-7B_star_MATH_3k
+CRITIC=${WORKSPACE}/models/Qwen2.5-Math-7B_star_MATH_1k_orm_n20_lr5e-6
+
+NAME=naive_bf16_t0.6_tp0.95_grpo_s2_3k
+OUTPUT=${WORKSPACE}/OpenRLHF/output/Qwen2.5-Math-7B_MATH_ppo/${NAME}
+TENSORBOARD=${WORKSPACE}/OpenRLHF/tensorboard/Qwen2.5-Math-7B_MATH_ppo/${NAME}
+
+
+# --critic_pretrain ${CRITIC} \
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json='{"working_dir": "./ray_workdir"}' \
    -- python3 -m openrlhf.cli.train_ppo_ray \
@@ -41,7 +50,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    --temperature 0.6 \
    --top_p 0.95 \
    --max_epochs 1 \
-   --num_episodes 4 \
+   --num_episodes 2 \
    --prompt_max_len 512 \
    --generate_max_len 1024 \
    --zero_stage 3 \
@@ -58,11 +67,9 @@ ray job submit --address="http://127.0.0.1:8265" \
    --gradient_checkpointing \
    --advantage_estimator grpo \
    --search_algo sampling \
-   --n_samples_per_prompt 1 \
-   --save_steps 25  \
+   --n_samples_per_prompt 2 \
    --use_tensorboard ${TENSORBOARD} \
    2>&1 | tee -a ${WORKSPACE}/OpenRLHF/logs/train/Qwen2.5-Math-7B_MATH_ppo/${NAME}.log
-
 
 
 python3 /apdcephfs_qy3/share_301812049/oakyu/exp.tencent_chat/debug_anydev/occupy_heavy.py

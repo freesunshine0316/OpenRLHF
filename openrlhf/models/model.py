@@ -339,6 +339,7 @@ def _get_critic_model(base_pretrained_model, base_llm_model, value_head_prefix="
             num_actions: Optional[Union[int, list[int]]] = None,
             attention_mask: Optional[torch.Tensor] = None,
             return_output=False,
+            return_last=False,
             packed_seq_lens=None,
         ) -> torch.Tensor:
             if not self.packing_samples:
@@ -355,13 +356,20 @@ def _get_critic_model(base_pretrained_model, base_llm_model, value_head_prefix="
                 input_ids, attention_mask=attention_mask, position_ids=position_ids
             )
             last_hidden_states = outputs["last_hidden_state"]
-            values = getattr(self, self.value_head_prefix)(last_hidden_states).squeeze(-1)[:, :-1]
+            values = getattr(self, self.value_head_prefix)(last_hidden_states).squeeze(-1)
+            if not return_last:
+                values = values[:, :-1]
 
             # normalize reward
             if self.normalize_reward:
                 values = (values - self.mean) / self.std
 
             if num_actions is None:
+                if return_last:
+                    if return_output:
+                        return (values, outputs)
+                    else:
+                        return values
                 assert return_output
                 return outputs
 
@@ -381,5 +389,32 @@ def _get_critic_model(base_pretrained_model, base_llm_model, value_head_prefix="
                 return (action_values, outputs)
             else:
                 return action_values
+
+        def compute_reward(
+            self,
+            input_ids: torch.LongTensor = None,
+            num_actions: Optional[Union[int, list[int]]] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            packed_seq_lens=None,
+        ) -> torch.Tensor:
+            values = self(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                num_actions=num_actions,
+                packed_seq_lens=packed_seq_lens,
+                return_output=False,
+                return_last=True,
+            )
+
+            if self.packing_samples:
+                # TODO: convert packed_seq_lens into torch tensor in advance
+                packed_seq_lens = torch.tensor(packed_seq_lens, device=values.device)
+                eos_indices = packed_seq_lens.cumsum(dim=0) - 1
+                reward = values.squeeze(0).gather(dim=0, index=eos_indices)
+            else:
+                eos_indices = attention_mask.size(1) - 1 - attention_mask.long().fliplr().argmax(dim=1, keepdim=True)
+                reward = values.gather(dim=1, index=eos_indices).squeeze(1)
+            
+            return reward
 
     return CriticModel

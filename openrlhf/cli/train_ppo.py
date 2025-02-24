@@ -289,7 +289,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # custom
     parser.add_argument("--search_algo", type=str, default="sampling",
-                        choices=['sampling', 'beamsearch', 'litesearch', 'bestofn'])
+                        choices=['sampling', 'beamsearch', 'litesearch', 'bestofn-random', 'bestofn-random2', 'bestofn-best', 'bestofn-bestandworst'])
     parser.add_argument("--freeze_critic", action="store_true", default=False)
     parser.add_argument("--enable_test_memory_mode", action="store_true", default=False)
 
@@ -433,6 +433,8 @@ if __name__ == "__main__":
     #         args.critic_pretrain = args.reward_pretrain
     #     else:
     #         args.critic_pretrain = args.pretrain
+    if args.advantage_estimator not in ["gae"]:
+        args.freeze_critic = True
 
     if args.advantage_estimator == "rloo":
         assert args.n_samples_per_prompt > 1, "RLOO requires n_samples_per_prompt > 1"

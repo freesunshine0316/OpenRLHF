@@ -164,6 +164,22 @@ class CriticModelRayActor(BasePPORole):
         self.critic.train()  # reset model state
         return value.to("cpu")
 
+    def compute_reward(
+        self,
+        input_ids: torch.LongTensor = None,
+        num_actions: Optional[Union[int, list[int]]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        packed_seq_lens=None,
+    ) -> torch.Tensor:
+        device = torch.cuda.current_device()
+        self.critic.eval()
+        with torch.no_grad():
+            reward = self.critic.compute_reward(
+                input_ids.to(device), num_actions, attention_mask.to(device), packed_seq_lens=packed_seq_lens
+            )
+        self.critic.train()  # reset model state
+        return reward.to("cpu")
+
     def append(self, experience):
         """Append experience to replay buffer."""
         self.trainer.replay_buffer.append(experience)
@@ -179,6 +195,9 @@ class CriticModelRayActor(BasePPORole):
 
     def empty_cache(self) -> None:
         torch.cuda.empty_cache()
+
+    def eval(self):
+        self.critic.eval()
 
     def save_model(self):
         args = self.strategy.args

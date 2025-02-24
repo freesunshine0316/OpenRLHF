@@ -1,5 +1,4 @@
 import os
-import traceback
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List
@@ -11,6 +10,7 @@ from openrlhf.remote_rm.utils import extract_gsm8k_numbers, extract_answer, answ
 from openrlhf.remote_rm.qwen_math_eval_toolkit.grader import math_equal as qwen_math_equal
 from openrlhf.remote_rm.qwen_math_eval_toolkit.parser import extract_answer as qwen_extract_answer
 from multiprocessing import Process, Queue
+from functools import lru_cache
 
 
 def get_reward_r1_zero(sequences, queries, responses):
@@ -63,10 +63,13 @@ def qwen_math_equal_subprocess(prediction, reference,  timeout_seconds=10):
     # 添加超时处理
     p.join(timeout=timeout_seconds)  # 等待进程完成，最多等待 timeout_seconds 秒
 
-    # 如果进程还在运行，则终止它并返回 False
     if p.is_alive():
-        p.terminate()
-        p.join()  # 确保进程被完全清理
+        p.terminate()  # 发送 SIGTERM
+        p.join(timeout=1)  # 等待1秒
+        if p.is_alive():
+            print("force kill")
+            p.kill()  # 发送 SIGKILL
+            p.join()
         return False
 
     # 如果进程正常完成，获取结果
@@ -114,6 +117,28 @@ def get_reward_qwen_math(sequences, queries, responses):
     return rewards
 
 
+@lru_cache(maxsize=128)
+def _get_reward(q, response):
+    try:
+        q = q.split('Answer:')[0].strip().split('Question:')[-1].strip()
+        v = answer_dict.get(q, None)
+        if v is None:
+            return -1
+        ref, data_type = v["ref"], v["type"]
+        hyp = extract_answer(response, data_type)
+        if hyp == "[INVALID]":
+            print((hyp, ref, -1))
+            return -1
+        if grade_answer(hyp, ref):
+            print((hyp, ref, 1))
+            return 1
+        else:
+            print((hyp, ref, -1))
+            return -1
+    except Exception as e:
+        print(e)
+        return -1
+
 
 def get_reward(sequences, queries, responses):
     """
@@ -121,26 +146,7 @@ def get_reward(sequences, queries, responses):
     """
     rewards = []
     for q, response in zip(queries, responses):
-        try:
-            q = q.split('Answer:')[0].strip().split('Question:')[-1].strip()
-            v = answer_dict.get(q, None)
-            if v is None:
-                rewards.append(-1)
-                continue
-            ref, data_type = v["ref"], v["type"]
-            hyp = extract_answer(response, data_type)
-            if hyp == "[INVALID]":
-                rewards.append(-1)
-                print((hyp, ref, rewards[-1]))
-                continue
-            if grade_answer(hyp, ref):
-                rewards.append(1)
-            else:
-                rewards.append(-1)
-            print((hyp, ref, rewards[-1]))
-        except Exception as e:
-            print(e)
-            rewards.append(-1)
+        rewards.append(_get_reward(q, response))
     return rewards
 
 app = FastAPI()
