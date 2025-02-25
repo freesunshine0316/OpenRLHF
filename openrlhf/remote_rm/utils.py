@@ -36,21 +36,30 @@ def extract_answer(text, data_type):
 
     if len(text_split) == 2:
         content = text_split[-1].strip()
-        if content[-1] == ".":
+        if len(content) > 0 and content[-1] == ".":
             content = content[:-1]
         if data_type == "gsm8k":
+            content = extract_gsm8k_numbers(content)
+        if data_type == "aime2024":
             content = extract_gsm8k_numbers(content)
         return content
     return "[INVALID]"
 
 
-data_fpath_list = [
-    "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/gsm8k/train.jsonl",
-    "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/math/train.jsonl",
-    "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/gsm8k/test.jsonl",
-    "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/math/test.jsonl"
-]
-
+if os.path.exists("/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/gsm8k/train.jsonl"):
+    data_fpath_list = [
+        "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/gsm8k/train.jsonl",
+        "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/math/train.jsonl",
+        "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/gsm8k/test.jsonl",
+        "/apdcephfs_sh2/share_300000800/user/antewang/Qwen2.5-Math/evaluation/data/math/test.jsonl"
+    ]
+else:
+    data_fpath_list = [
+        "/apdcephfs_qy3/share_301812049/oakyu/exp.tencent_chat/Qwen2.5-Math-evaluation/data/gsm8k/train.jsonl",
+        "/apdcephfs_qy3/share_301812049/oakyu/exp.tencent_chat/Qwen2.5-Math-evaluation/data/math/train.jsonl",
+        "/apdcephfs_qy3/share_301812049/oakyu/exp.tencent_chat/Qwen2.5-Math-evaluation/data/gsm8k/test.jsonl",
+        "/apdcephfs_qy3/share_301812049/oakyu/exp.tencent_chat/Qwen2.5-Math-evaluation/data/math/test.jsonl"
+    ]
 
 dataset = []
 for data_fpath in data_fpath_list:

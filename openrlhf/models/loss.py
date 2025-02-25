@@ -333,3 +333,26 @@ class PRMLoss(nn.Module):
             labels = labels.argmax(dim=-1)
         acc = (logits.argmax(dim=-1) == labels).float().mean()
         return loss, acc
+
+
+class ORMLoss(nn.Module):
+    """
+    Outcome Reward Model Loss
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.IGNORE_INDEX = -100
+
+    def forward(
+        self, 
+        scores: torch.Tensor, 
+        labels: torch.Tensor, 
+        action_mask: torch.Tensor,
+    ):
+        assert scores.ndim == 2 and labels.ndim == 1
+        labels = labels.unsqueeze(1).expand_as(scores)
+
+        loss = (scores - labels) ** 2
+        loss = masked_mean(loss, action_mask, dim=-1).mean()
+        return 0.5 * loss

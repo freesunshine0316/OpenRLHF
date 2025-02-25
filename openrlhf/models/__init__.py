@@ -8,6 +8,7 @@ from .loss import (
     PairWiseLoss,
     PolicyLoss,
     PRMLoss,
+    ORMLoss,
     ValueLoss,
     VanillaKTOLoss,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "PairWiseLoss",
     "PolicyLoss",
     "PRMLoss",
+    "ORMLoss",
     "ValueLoss",
     "VanillaKTOLoss",
     "get_llm_for_sequence_regression",
