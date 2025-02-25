@@ -10,18 +10,6 @@ from tqdm import tqdm
 from openrlhf.search_algorithm.search_utils import Tree, Node, \
     DEFAULT_TEMPERATURE, DEFAULT_BEAM_SIZE, DEFAULT_MAX_LENGTH, DEFAULT_MAX_STEP_LENGTH
 
-# temporal hard code
-LIMIT=32
-N=8
-BEAM=4
-TEMPERATURE=1
-MAX_REPEAT=2
-END_OF_STEP=["\n\n", "\n", "<|endoftext|>"]
-MAX_CHAR_PER_STEP = 1024
-MAX_CHAR_PER_PATH = 4096
-MAX_NEW_TOKENS=512
-ADD_GREEDY = False
-
 def clean_pad_token(text, pad_token):
     return re.sub(pad_token, "", text)
 
@@ -95,10 +83,10 @@ def get_full_traj_vllm(traj, tokenizer, actor):
     llms = actor
     trajs = [traj]
     sampling_params = SamplingParams(
-        temperature=TEMPERATURE,
+        temperature=DEFAULT_TEMPERATURE,
         top_p=1,
         top_k=-1,
-        max_tokens=1024,
+        max_tokens=DEFAULT_MAX_LENGTH,
         min_tokens=1,
         skip_special_tokens=False,
         include_stop_str_in_output=True,
@@ -128,12 +116,12 @@ def get_full_traj_vllm(traj, tokenizer, actor):
 def get_next_steps_vllm(trajs, tokenizer, actor):
     llms = actor
     sampling_params = SamplingParams(
-        temperature=TEMPERATURE,
+        temperature=DEFAULT_TEMPERATURE,
         top_p=1,
         top_k=-1,
-        max_tokens=1024,
+        max_tokens=DEFAULT_MAX_STEP_LENGTH,
         min_tokens=1,
-        stop=["\n"],
+        stop=["\n", "\n\n"],
         skip_special_tokens=False,
         include_stop_str_in_output=True,
         logprobs = 0,
@@ -233,8 +221,6 @@ def process_single_query(query, args):
                 anchor, 
                 next_step.endswith(args["tokenizer"].eos_token)
             )
-            if len(next_step) == 0 or len(next_step) > args["MAX_CHAR_PER_STEP"] or len(traj + next_step) > args["MAX_CHAR_PER_PATH"]:
-                state.value = min(-100, state.value)
 
     # 返回最佳轨迹
     terminal_nodes = [node for node in tree.all_nodes if node.is_leaf]
@@ -257,11 +243,9 @@ def search_vllm(queries, tokenizer, actor, critic=None, search_args=None):
         "tokenizer": tokenizer,
         "actor": actor,
         "critic": critic,
-        "BEAM": BEAM,
-        "N": N,
+        "BEAM": DEFAULT_BEAM_SIZE,
+        "N": DEFAULT_N,
         "LIMIT": 32,
-        "MAX_CHAR_PER_STEP": MAX_CHAR_PER_STEP,
-        "MAX_CHAR_PER_PATH": MAX_CHAR_PER_PATH,
         "search_args": search_args
     }
 

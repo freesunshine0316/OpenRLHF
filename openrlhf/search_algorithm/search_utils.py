@@ -49,20 +49,7 @@ class Tree:
     def get_beam_to_expand(self, beam_size=5):
         curr_timestep = self.return_timestep()
         latest_nodes = [node for node in self.all_nodes if node.is_leaf or node.timestep == curr_timestep]
-        # beam = sorted(latest_nodes, key=lambda x: x.value, reverse=True)[:beam_size]
-        content_dict = {}
-        beam = []
-        for node in sorted(latest_nodes, key=lambda x: x.value, reverse=True):
-            if content_dict.get(node.content, 0) >= MAX_REPEAT and node.value < 0:
-                continue
-            beam.append(node)
-            if len(beam) >= beam_size:
-                break
-            if not node.is_leaf:
-                if node.content not in content_dict:
-                    content_dict[node.content] = 1
-                else:
-                    content_dict[node.content] += 1
+        beam = sorted(latest_nodes, key=lambda x: x.value, reverse=True)[:beam_size]
         return [node for node in beam if not node.is_leaf]
 ########
 
