@@ -7,8 +7,45 @@ import ray
 import numpy as np
 import jsonlines
 from tqdm import tqdm
-from openrlhf.search_algorithm.search_utils import Tree, Node, \
-    DEFAULT_TEMPERATURE, DEFAULT_BEAM_SIZE, DEFAULT_MAX_LENGTH, DEFAULT_MAX_STEP_LENGTH
+
+#### Search Tree ####
+from openrlhf.search_algorithm.search_utils import Node
+from openrlhf.search_algorithm.search_utils import Tree as DefaultTree
+from openrlhf.search_algorithm.search_utils import DEFAULT_MAX_LENGTH, DEFAULT_TEMPERATURE, DEFAULT_PRM_URLS
+
+LIMIT=16
+N=8
+BEAM=4
+TEMPERATURE = DEFAULT_TEMPERATURE
+MAX_LENGTH = DEFAULT_MAX_LENGTH
+MAX_REPEAT=2
+END_OF_STEP=["\n\n", "\n", "<|endoftext|>"]
+ADD_GREEDY = False
+PRM_URLS = DEFAULT_PRM_URLS
+
+class Tree(DefaultTree):
+    def __init__(self, question):
+        super().__init__(question)
+
+    def get_beam_to_expand(self, beam_size=5):
+        curr_timestep = self.return_timestep()
+        latest_nodes = [node for node in self.all_nodes if node.is_leaf or node.timestep == curr_timestep]
+        # beam = sorted(latest_nodes, key=lambda x: x.value, reverse=True)[:beam_size]
+        content_dict = {}
+        beam = []
+        for node in sorted(latest_nodes, key=lambda x: x.value, reverse=True):
+            if content_dict.get(node.content, 0) >= MAX_REPEAT:
+                continue
+            beam.append(node)
+            if len(beam) >= beam_size:
+                break
+            if not node.is_leaf:
+                if node.content not in content_dict:
+                    content_dict[node.content] = 1
+                else:
+                    content_dict[node.content] += 1
+        return [node for node in beam if not node.is_leaf]
+########
 
 def clean_pad_token(text, pad_token):
     return re.sub(pad_token, "", text)
@@ -17,7 +54,7 @@ def get_full_traj(traj, tokenizer, actor, greedy=False):
     input_ids = tokenizer(traj, return_tensors="pt")
     input_ids = {k: v.to(actor.model.device) for k, v in input_ids.items()}
     outputs = actor.model.generate(**input_ids, do_sample=not greedy, max_new_tokens=1024,
-                             temperature=DEFAULT_TEMPERATURE, tokenizer=tokenizer,
+                             temperature=TEMPERATURE, tokenizer=tokenizer, 
                              pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
     sequences = tokenizer.batch_decode(outputs, keep_special_tokens=True)
     sequences = [clean_pad_token(seq, tokenizer.pad_token) for seq in sequences]
@@ -27,7 +64,7 @@ def get_next_steps(trajs, tokenizer, actor):
     input_ids = tokenizer(trajs, padding=True, return_tensors="pt")
     input_ids = {k: v.to(actor.model.device) for k, v in input_ids.items()}
     outputs = actor.model.generate(**input_ids, do_sample=True, stop_strings=END_OF_STEP, max_new_tokens=MAX_NEW_TOKENS,
-                             temperature=DEFAULT_TEMPERATURE, tokenizer=tokenizer, pad_token_id=tokenizer.pad_token_id)
+                             temperature=TEMPERATURE, tokenizer=tokenizer, pad_token_id=tokenizer.pad_token_id)
     input_len = input_ids["input_ids"].shape[1]
     sequences = tokenizer.batch_decode(outputs[:, input_len:], keep_special_tokens=True)
     sequences = [clean_pad_token(seq, tokenizer.pad_token) for seq in sequences]
@@ -59,7 +96,7 @@ def search(query, tokenizer, actor, critic):
                 # print((search_iter, traj, next_step, next_value))
         else:
             break
-
+    
     # return the best traj
     terminal_nodes = [node for node in tree.all_nodes if node.is_leaf]
     final_traj = None
@@ -79,14 +116,13 @@ def search(query, tokenizer, actor, critic):
         return [final_traj]
 
 
-def get_full_traj_vllm(traj, tokenizer, actor):
+def get_full_traj_vllm(trajs, tokenizer, actor):
     llms = actor
-    trajs = [traj]
     sampling_params = SamplingParams(
-        temperature=DEFAULT_TEMPERATURE,
+        temperature=TEMPERATURE,
         top_p=1,
         top_k=-1,
-        max_tokens=DEFAULT_MAX_LENGTH,
+        max_tokens=MAX_LENGTH,
         min_tokens=1,
         skip_special_tokens=False,
         include_stop_str_in_output=True,
@@ -111,17 +147,19 @@ def get_full_traj_vllm(traj, tokenizer, actor):
     # Retrieve and combine results from all outputs
     all_outputs = sum(ray.get(all_output_refs), [])
     sequences = [output.outputs[0].text for output in all_outputs]
-    return sequences
+    cumulative_logprobs = [output.outputs[0].cumulative_logprob for output in all_outputs]
+    avg_logprobs = [sum(list(item.values())[0].logprob for item in output.outputs[0].logprobs) / len(output.outputs[0].logprobs) for output in all_outputs] # if the same logprob, prefer longer sequence
+    return sequences, cumulative_logprobs, avg_logprobs
 
 def get_next_steps_vllm(trajs, tokenizer, actor):
     llms = actor
     sampling_params = SamplingParams(
-        temperature=DEFAULT_TEMPERATURE,
+        temperature=TEMPERATURE,
         top_p=1,
         top_k=-1,
-        max_tokens=DEFAULT_MAX_STEP_LENGTH,
+        max_tokens=MAX_LENGTH,
         min_tokens=1,
-        stop=["\n", "\n\n"],
+        stop=END_OF_STEP,
         skip_special_tokens=False,
         include_stop_str_in_output=True,
         logprobs = 0,
@@ -189,6 +227,38 @@ def get_next_steps_vllm(trajs, tokenizer, actor):
 #     pbar.close()
 #     return results
 
+def call_reward(texts):
+    if isinstance(texts, str):
+        texts = [texts]
+    url = random.choice(PRM_URLS)
+    pload ={"texts": texts}
+    response =requests.post(url, json=pload)
+    return response.json()["rewards"]
+
+def occupy_gpu(stop_event, device='cuda:0'):
+    device = torch.device(device)
+    try:
+        a = torch.randn(10000,10000).cuda(device)
+        b = torch.randn(10000,10000).cuda(device)
+        ta = a
+        tb = b
+        while not stop_event.is_set():
+            a = ta
+            b = tb
+            a = torch.sin(a)
+            b = torch.sin(b)
+            a = torch.cos(a)
+            b = torch.cos(b)
+            a = torch.tan(a)
+            b = torch.tan(b)
+            a = torch.exp(a)
+            b = torch.exp(b)
+            a = torch.log(a)
+            b = torch.log(b)
+            b = torch.matmul(a, b)
+    except Exception as e:
+        print(f"[{device}] 发生异常: {str(e)}")
+
 # multi-threads
 def process_single_query(query, args):
     """处理单个查询的线程函数"""
@@ -207,45 +277,64 @@ def process_single_query(query, args):
         expanded_trajs = trajs * (args["N"] // args["BEAM"])
         expanded_anchors = actions * (args["N"] // args["BEAM"])
 
-        with torch.no_grad():
+        if search_iter == args["LIMIT"] - 1:
+            next_steps, sum_logps, avg_logps = get_full_traj_vllm(
+            expanded_trajs, args["tokenizer"], args["actor"]
+        )
+        else:
             next_steps, sum_logps, avg_logps = get_next_steps_vllm(
-                expanded_trajs, args["tokenizer"], args["actor"]
-            )
-            next_values = avg_logps if args["search_args"]["compute_reward_strategy"] == "average" else sum_logps
+            expanded_trajs, args["tokenizer"], args["actor"]
+        )
+        next_values = avg_logps if args["search_args"]["compute_reward_strategy"] == "average" else sum_logps
 
         for anchor, traj, next_step, next_value in zip(expanded_anchors, expanded_trajs, next_steps, next_values):
-            next_value += anchor.value if anchor.parent is not None else 0
+            if search_args["reward_strategy"] == "prm":
+                next_value = call_reward([traj + next_step])[0]
+            elif search_args["reward_strategy"] == "prob":
+                next_value += anchor.value if anchor.parent is not None else 0
+            else:
+                raise Exception(f"不支持的reward_strategy: {search_args['reward_strategy']}")
             state = tree.add_node(
                 next_step, 
                 next_value, 
                 anchor, 
                 next_step.endswith(args["tokenizer"].eos_token)
             )
+            if len(next_step) == 0 or not any(next_step.endswith(eos) for eos in END_OF_STEP):
+                state.value = min(-100, state.value)
 
     # 返回最佳轨迹
     terminal_nodes = [node for node in tree.all_nodes if node.is_leaf]
     if terminal_nodes:
         best_node = max(terminal_nodes, key=lambda x: x.value)
-        return best_node.print_path()
+        return best_node.print_path(with_question=False)
     else:
         with torch.no_grad():
-            return get_full_traj_vllm(processed_query, args["tokenizer"], args["actor"])[0]
+            return get_full_traj_vllm(processed_query, args["tokenizer"], args["actor"])[0][0]
 
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+import threading
 
 def search_vllm(queries, tokenizer, actor, critic=None, search_args=None):
     """多线程处理主函数"""
     
     rank = torch.distributed.get_rank()  # 注意：需要确认多线程环境下的rank行为
 
+    stop_event = threading.Event()
+    device = f'cuda:{rank}'
+    
+    # 启动占卡线程
+    t = threading.Thread(target=occupy_gpu, args=(stop_event,))
+    t.start()
+
     worker_args = {
         "tokenizer": tokenizer,
         "actor": actor,
         "critic": critic,
-        "BEAM": DEFAULT_BEAM_SIZE,
-        "N": DEFAULT_N,
-        "LIMIT": 32,
+        "BEAM": BEAM,
+        "N": N,
+        "LIMIT": LIMIT,
         "search_args": search_args
     }
 
@@ -272,4 +361,7 @@ def search_vllm(queries, tokenizer, actor, critic=None, search_args=None):
                     print(f"Error processing query: {str(e)}")
                     results.append(None)  # 或者根据需求处理异常
     
+    stop_event.set()    
+    # 等待所有线程退出
+    t.join(timeout=3)
     return results

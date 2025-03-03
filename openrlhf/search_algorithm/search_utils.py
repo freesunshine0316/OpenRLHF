@@ -1,12 +1,13 @@
-
 import jsonlines
 
 DEFAULT_N = 8
-DEFAULT_BEAM_SIZE = 1
-DEFAULT_TEMPERATURE = 1
+DEFAULT_BEAM_SIZE = 4
+DEFAULT_SEARCH_STEPS = 5
+DEFAULT_TEMPERATURE = 1.0
 DEFAULT_MAX_LENGTH = 1024
-DEFAULT_MAX_STEP_LENGTH = 1024
-strategy = "best"
+DEFAULT_MAX_STEP_LENGTH = 256
+DEFAULT_PRM_URLS = ["http://30.159.163.212:8001/predict", "http://30.159.163.212:8002/predict", "http://30.159.163.212:8003/predict", "http://30.159.163.212:8004/predict"]
+
 
 #### Search Tree Data Structure ####
 class Node:
@@ -27,8 +28,11 @@ class Node:
             return [self.content]
         return self.parent.return_path() + [self.content]
 
-    def print_path(self):
-        return "".join(self.return_path())
+    def print_path(self, with_question=True):
+        if with_question:
+            return "".join(self.return_path())
+        else:
+            return "".join(self.return_path()[1:])
 
 class Tree:
     def __init__(self, question):
@@ -48,7 +52,7 @@ class Tree:
 
     def get_beam_to_expand(self, beam_size=5):
         curr_timestep = self.return_timestep()
-        latest_nodes = [node for node in self.all_nodes if node.is_leaf or node.timestep == curr_timestep]
+        latest_nodes = [node for node in self.all_nodes if node.timestep == curr_timestep]
         beam = sorted(latest_nodes, key=lambda x: x.value, reverse=True)[:beam_size]
         return [node for node in beam if not node.is_leaf]
 ########
@@ -76,3 +80,6 @@ def initialize_question_answer_map():
 
     answer_dict = {item["question"].strip(): {"ref": item["answer"], "type": item["type"]} for item in dataset}
     return answer_dict
+
+def trajectory_finished(tokenizer, traj):
+    return traj.endswith(tokenizer.eos_token)
