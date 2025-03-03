@@ -54,7 +54,7 @@ def get_full_traj(traj, tokenizer, actor, greedy=False):
     input_ids = tokenizer(traj, return_tensors="pt")
     input_ids = {k: v.to(actor.model.device) for k, v in input_ids.items()}
     outputs = actor.model.generate(**input_ids, do_sample=not greedy, max_new_tokens=1024,
-                             temperature=TEMPERATURE, tokenizer=tokenizer, 
+                             temperature=DEFAULT_TEMPERATURE, tokenizer=tokenizer,
                              pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
     sequences = tokenizer.batch_decode(outputs, keep_special_tokens=True)
     sequences = [clean_pad_token(seq, tokenizer.pad_token) for seq in sequences]
@@ -64,7 +64,7 @@ def get_next_steps(trajs, tokenizer, actor):
     input_ids = tokenizer(trajs, padding=True, return_tensors="pt")
     input_ids = {k: v.to(actor.model.device) for k, v in input_ids.items()}
     outputs = actor.model.generate(**input_ids, do_sample=True, stop_strings=END_OF_STEP, max_new_tokens=MAX_NEW_TOKENS,
-                             temperature=TEMPERATURE, tokenizer=tokenizer, pad_token_id=tokenizer.pad_token_id)
+                             temperature=DEFAULT_TEMPERATURE, tokenizer=tokenizer, pad_token_id=tokenizer.pad_token_id)
     input_len = input_ids["input_ids"].shape[1]
     sequences = tokenizer.batch_decode(outputs[:, input_len:], keep_special_tokens=True)
     sequences = [clean_pad_token(seq, tokenizer.pad_token) for seq in sequences]
@@ -76,27 +76,37 @@ def get_step_scores(trajs, tokenizer, critic):
     outputs = critic.compute_value(**input_ids, return_dict=False)
     return (torch.clamp(outputs[0].squeeze(), min=-1, max=1) + 1) / 2
 
-def search(query, tokenizer, actor, critic):
+def search(query, tokenizer, actor, critic=None, search_args=None):
+
+    beam_size = search_args.get("beam_size", DEFAULT_BEAM_SIZE)
+    candidate_size = search_args.get("candidate_size", DEFAULT_N)
+    assert candidate_size % beam_size == 0
+    expand_size = candidate_size // beam_size
+    search_steps = search_args.get("search_steps", DEFAULT_SEARCH_STEPS)
+    max_step_length = search_args.get("max_step_length", DEFAULT_MAX_STEP_LENGTH)
+    max_length = search_args.get("max_length", DEFAULT_MAX_LENGTH)
+    add_greedy = search_args["add_greedy"]
+
     tree = Tree(query)
     query = tree.question
-    for search_iter in range(LIMIT):
-        actions = tree.get_beam_to_expand(BEAM)
+    for search_iter in range(search_steps):
+        actions = tree.get_beam_to_expand(beam_size)
         if search_iter < 1:
-            actions = actions * BEAM
+            actions = actions * beam_size
         if actions:
             trajs = [action.print_path() for action in actions]
-            trajs, anchors = trajs * (N // BEAM), actions * (N // BEAM)
+            trajs, anchors = trajs * expand_size, actions * expand_size
             with torch.no_grad():
                 next_steps = get_next_steps(trajs, tokenizer, actor)
                 next_values = get_step_scores([traj + next_step for traj, next_step in zip(trajs, next_steps)], tokenizer, critic)
             for anchor, traj, next_step, next_value in zip(anchors, trajs, next_steps, next_values):
                 state = tree.add_node(next_step, next_value.item(), anchor, next_step.endswith(tokenizer.eos_token))
-                if len(next_step) == 0 or len(next_step) > MAX_CHAR_PER_STEP or len(traj + next_step) > MAX_CHAR_PER_PATH:
+                if len(next_step) == 0 or len(next_step) > max_step_length or len(traj + next_step) > max_length:
                     state.value = -1
                 # print((search_iter, traj, next_step, next_value))
         else:
             break
-    
+
     # return the best traj
     terminal_nodes = [node for node in tree.all_nodes if node.is_leaf]
     final_traj = None
@@ -107,8 +117,8 @@ def search(query, tokenizer, actor, critic):
         with torch.no_grad():
             final_traj = get_full_traj(query, tokenizer, actor)
         # return None
-    
-    if ADD_GREEDY:
+
+    if add_greedy:
         with torch.no_grad():
             greedy_traj = get_full_traj(query, tokenizer, actor, greedy=True)
         return [final_traj, greedy_traj]
