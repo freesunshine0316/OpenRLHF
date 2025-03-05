@@ -13,7 +13,7 @@ from pprint import pprint
 import numpy as np
 
 from openrlhf.remote_rm.ds_prover.lean.ast_parser import lean4_parser
-from openrlhf.remote_rm.ds_prover.workers import ProcessScheduler
+from openrlhf.remote_rm.ds_prover.scheduler import ProcessScheduler
 from openrlhf.remote_rm.ds_prover.utils import AttrDict
 
 
