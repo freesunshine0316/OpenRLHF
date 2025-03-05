@@ -24,7 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class InputText(BaseModel):
-    queries: List[dict]  # Contains formal_statement and proof
+    query: List[dict]  # Contains formal_statement and proof
 
 class OutputPrediction(BaseModel):
     rewards: List[float]
@@ -73,33 +73,66 @@ def parse_error_positions(error_output, proof_content):
                 
     return error_positions
 
+def extract_proof_content(text):
+    """提取证明内容，处理两种情况:
+    1. 带有### Response:的完整对话格式
+    2. 直接的证明内容
+    """
+    # 处理带有### Response:的情况
+    if "### Response:" in text:
+        # 提取Response后的内容
+        proof = text.split("### Response:")[1].strip()
+    else:
+        proof = text.strip()
+    
+    # 清理证明中的数学注释部分
+    if "/-" in proof and "-/" in proof:
+        proof = proof[proof.find("-/"):].strip()
+        if proof.startswith("-/"):
+            proof = proof[2:].strip()
+    
+    return proof
+
 @app.post("/predict")
 async def predict(input_text: InputText) -> OutputPrediction:
+    logger.info(f"Received request: {input_text}")
     rewards = []
 
-    for query in input_text.queries:
+    for query in input_text.query:
         try:
             start_time = time.time()
-            logger.info(f"Processing query with statement: {query['formal_statement']}")
+            
+            # 如果直接传入formal_statement和proof
+            if isinstance(query, dict) and 'formal_statement' in query:
+                formal_statement = query['formal_statement']
+                proof_content = query.get('proof', '')
+            else:
+                # 处理整个文本输入的情况
+                text = query if isinstance(query, str) else str(query)
+                proof_content = extract_proof_content(text)
+                # 从proof中提取formal_statement
+                formal_statement = proof_content.split(':=')[0] if ':=' in proof_content else ''
 
-            if 'proof' in query and query['proof']:
-                original_proof = query['proof']
-                cleaned_proof = clean_proof_backticks(original_proof)
-                if original_proof != cleaned_proof:
+            logger.info(f"Extracted formal statement: {formal_statement}")
+            logger.info(f"Extracted proof: {proof_content}")
+
+            if proof_content:
+                cleaned_proof = clean_proof_backticks(proof_content)
+                if proof_content != cleaned_proof:
                     logger.info("Cleaned extraneous backticks from proof")
-                query['proof'] = cleaned_proof
+                proof_content = cleaned_proof
 
             summarizer = ProofSummarizer(
                 data={
-                    'formal_statement': query['formal_statement'],
+                    'formal_statement': formal_statement,
                 },
                 scheduler=lean4_scheduler
             )
 
-            logger.info(f"Analyzing proof: {query['proof']}")
+            logger.info(f"Analyzing proof: {proof_content}")
 
             proof = summarizer.analyze(
-                code=query['proof'],
+                code=proof_content,
                 require_verification=True
             )
 
@@ -135,7 +168,7 @@ async def predict_detail(input_text: InputText):
     rewards = []
     details = []
     
-    for query in input_text.queries:
+    for query in input_text.query:
         try:
             start_time = time.time()
             detail = {
