@@ -5,10 +5,30 @@ import re
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List
+from asyncio import Queue, Lock
 
 from openrlhf.remote_rm.ds_prover.lean.verifier import Lean4ServerScheduler
 from openrlhf.remote_rm.ds_prover.lean.proof import ProofSummarizer
 from openrlhf.remote_rm.ds_prover.utils import AttrDict
+
+class Lean4ServerManager:
+    def __init__(self, max_concurrent=8):
+        self.queue = Queue()
+        self.active_requests = 0
+        self.lock = Lock()
+        self.max_concurrent = max_concurrent
+
+    async def process_request(self, request):
+        if self.active_requests >= self.max_concurrent:
+            await self.queue.put(request)
+            return await self.queue.get()
+        
+        async with self.lock:
+            self.active_requests += 1
+        try:
+            return await self._process(request)
+        finally:
+            self.active_requests -= 1
 
 # 初始化FastAPI应用
 app = FastAPI()
@@ -24,7 +44,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class InputText(BaseModel):
-    query: List[dict]  # Contains formal_statement and proof
+    query: List[str]  # List of strings containing theorem and proof
 
 class OutputPrediction(BaseModel):
     rewards: List[float]
@@ -74,25 +94,48 @@ def parse_error_positions(error_output, proof_content):
     return error_positions
 
 def extract_proof_content(text):
-    """提取证明内容，处理两种情况:
-    1. 带有### Response:的完整对话格式
-    2. 直接的证明内容
+    """提取证明内容，处理以下格式:
+    - 从theorem开始的行提取formal_statement
+    - 从:=开始到结束的部分作为proof_content
+    返回tuple (formal_statement, proof_content)
     """
-    # 处理带有### Response:的情况
-    if "### Response:" in text:
-        # 提取Response后的内容
-        proof = text.split("### Response:")[1].strip()
-    else:
-        proof = text.strip()
+    # 查找包含theorem的行
+    lines = text.split('\n')
+    theorem_line = None
+    for line in lines:
+        if 'theorem' in line:
+            theorem_line = line.strip()
+            break
     
-    # 清理证明中的数学注释部分
-    if "/-" in proof and "-/" in proof:
-        proof = proof[proof.find("-/"):].strip()
-        if proof.startswith("-/"):
-            proof = proof[2:].strip()
+    if not theorem_line:
+        return '', ''
     
-    return proof
+    # 提取formal_statement (不包含:=)
+    formal_statement = theorem_line
+    if ':=' in theorem_line:
+        formal_statement = theorem_line.split(':=')[0].strip()
+    
+    # 提取proof_content (从:=开始到结束)
+    all_content = '\n'.join(lines)
+    proof_content = ''
+    if ':=' in all_content:
+        proof_content = ':=' + all_content.split(':=')[1].strip()
+        
+    # 清理proof_content中的反引号
+    proof_content = clean_proof_backticks(proof_content)
+    
+    return formal_statement, proof_content
 
+# 1. 修改等待验证结果的方式
+async def wait_for_proof_result(proof, timeout=300):
+    start_time = time.time()
+    while not proof.is_result_ready():
+        if time.time() - start_time > timeout:
+            raise TimeoutError("Proof verification timeout")
+        await asyncio.sleep(0.1)  # 使用asyncio.sleep避免CPU忙等待
+    return proof.result
+
+# 2. 在predict函数中使用
 @app.post("/predict")
 async def predict(input_text: InputText) -> OutputPrediction:
     logger.info(f"Received request: {input_text}")
@@ -105,22 +148,17 @@ async def predict(input_text: InputText) -> OutputPrediction:
             # 如果直接传入formal_statement和proof
             if isinstance(query, dict) and 'formal_statement' in query:
                 formal_statement = query['formal_statement']
+                formal_statement = formal_statement.strip(':=')[0] if ':=' in formal_statement else formal_statement
                 proof_content = query.get('proof', '')
+                proof_content = proof_content.strip()
             else:
                 # 处理整个文本输入的情况
                 text = query if isinstance(query, str) else str(query)
-                proof_content = extract_proof_content(text)
-                # 从proof中提取formal_statement
-                formal_statement = proof_content.split(':=')[0] if ':=' in proof_content else ''
+                formal_statement, proof_content = extract_proof_content(text)
 
             logger.info(f"Extracted formal statement: {formal_statement}")
             logger.info(f"Extracted proof: {proof_content}")
 
-            if proof_content:
-                cleaned_proof = clean_proof_backticks(proof_content)
-                if proof_content != cleaned_proof:
-                    logger.info("Cleaned extraneous backticks from proof")
-                proof_content = cleaned_proof
 
             summarizer = ProofSummarizer(
                 data={
@@ -137,11 +175,13 @@ async def predict(input_text: InputText) -> OutputPrediction:
             )
 
             logger.info("Waiting for verification result...")
-            while not proof.is_result_ready():
-                pass
-
-            result = proof.result
-            logger.info(f"Verification result: {result}")
+            try:
+                result = await wait_for_proof_result(proof)
+                logger.info(f"Verification result: {result}")
+            except TimeoutError:
+                logger.error("Verification timeout")
+                rewards.append(-1.0)
+                continue
 
             if result.get('complete', False):
                 logger.info("Proof is complete and correct")
