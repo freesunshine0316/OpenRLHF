@@ -2,6 +2,7 @@ import traceback
 import logging
 import time
 import re
+import asyncio  
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List
@@ -30,13 +31,17 @@ class Lean4ServerManager:
         finally:
             self.active_requests -= 1
 
-# 初始化FastAPI应用
+
 app = FastAPI()
 
-# 配置验证器
-lean4_scheduler = Lean4ServerScheduler(max_concurrent_requests=8, timeout=300, memory_limit=10, name='verifier')
 
-# 配置logging为DEBUG级别
+lean4_scheduler = Lean4ServerScheduler(
+    max_concurrent_requests=32,  
+    timeout=600,               
+    memory_limit=80,           
+    name='verifier'
+)
+
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -94,12 +99,12 @@ def parse_error_positions(error_output, proof_content):
     return error_positions
 
 def extract_proof_content(text):
-    """提取证明内容，处理以下格式:
-    - 从theorem开始的行提取formal_statement
-    - 从:=开始到结束的部分作为proof_content
-    返回tuple (formal_statement, proof_content)
+    """Extract proof content, handle the following formats:
+    - Extract formal_statement from the line starting with theorem
+    - Extract proof_content from the part starting with := to the end
+    Return tuple (formal_statement, proof_content)
     """
-    # 查找包含theorem的行
+    # Find line containing theorem
     lines = text.split('\n')
     theorem_line = None
     for line in lines:
@@ -110,32 +115,36 @@ def extract_proof_content(text):
     if not theorem_line:
         return '', ''
     
-    # 提取formal_statement (不包含:=)
+    # Extract formal_statement (without :=)
     formal_statement = theorem_line
     if ':=' in theorem_line:
         formal_statement = theorem_line.split(':=')[0].strip()
     
-    # 提取proof_content (从:=开始到结束)
+    # Extract proof_content (from := to end)
     all_content = '\n'.join(lines)
     proof_content = ''
     if ':=' in all_content:
         proof_content = ':=' + all_content.split(':=')[1].strip()
         
-    # 清理proof_content中的反引号
+    # Clean backticks in proof_content
     proof_content = clean_proof_backticks(proof_content)
     
     return formal_statement, proof_content
 
-# 1. 修改等待验证结果的方式
-async def wait_for_proof_result(proof, timeout=300):
-    start_time = time.time()
-    while not proof.is_result_ready():
-        if time.time() - start_time > timeout:
-            raise TimeoutError("Proof verification timeout")
-        await asyncio.sleep(0.1)  # 使用asyncio.sleep避免CPU忙等待
-    return proof.result
 
-# 2. 在predict函数中使用
+async def wait_for_proof_result(proof, timeout=300):
+    try:
+        start_time = time.time()
+        while not proof.is_result_ready():
+            if time.time() - start_time > timeout:
+                raise TimeoutError("Proof verification timeout")
+            await asyncio.sleep(0.1)  
+        return proof.result
+    except Exception as e:
+        logger.error(f"Error waiting for proof result: {e}")
+        raise
+
+
 @app.post("/predict")
 async def predict(input_text: InputText) -> OutputPrediction:
     logger.info(f"Received request: {input_text}")
@@ -145,14 +154,14 @@ async def predict(input_text: InputText) -> OutputPrediction:
         try:
             start_time = time.time()
             
-            # 如果直接传入formal_statement和proof
+            # If formal_statement and proof are directly provided
             if isinstance(query, dict) and 'formal_statement' in query:
                 formal_statement = query['formal_statement']
                 formal_statement = formal_statement.strip(':=')[0] if ':=' in formal_statement else formal_statement
                 proof_content = query.get('proof', '')
                 proof_content = proof_content.strip()
             else:
-                # 处理整个文本输入的情况
+                # Handle full text input case
                 text = query if isinstance(query, str) else str(query)
                 formal_statement, proof_content = extract_proof_content(text)
 
@@ -178,20 +187,20 @@ async def predict(input_text: InputText) -> OutputPrediction:
             try:
                 result = await wait_for_proof_result(proof)
                 logger.info(f"Verification result: {result}")
+                
+                error_positions = parse_error_positions(
+                    result.get('output', ''), 
+                    proof_content
+                )
+                
+                reward = calculate_reward(result, error_positions, proof_content)
+                rewards.append(reward)
+                
+                logger.info(f"Calculated reward: {reward}")
             except TimeoutError:
                 logger.error("Verification timeout")
-                rewards.append(-1.0)
+                rewards.append(-0.6)  # Lighter penalty for timeout
                 continue
-
-            if result.get('complete', False):
-                logger.info("Proof is complete and correct")
-                rewards.append(1.0)  
-            elif result.get('pass', False):
-                logger.info("Proof passes but may use sorry")
-                rewards.append(0.5)  
-            else:
-                logger.info(f"Proof has errors: {result.get('errors', [])}")
-                rewards.append(-1.0)  
 
             logger.info(f"Verification completed in {time.time() - start_time:.2f} seconds")
             logger.info(f"Final rewards: {rewards}")
@@ -201,7 +210,12 @@ async def predict(input_text: InputText) -> OutputPrediction:
             logger.error(traceback.format_exc())
             rewards.append(-1.0)
 
+    assert len(rewards) == len(input_text.query), (
+        f"Rewards length ({len(rewards)}) does not match "
+        f"input queries length ({len(input_text.query)})"
+    )
     return {"rewards": rewards}
+
 
 @app.post("/predict_detail", response_model=DetailedOutputPrediction)
 async def predict_detail(input_text: InputText):
@@ -222,7 +236,6 @@ async def predict_detail(input_text: InputText):
                 'system_messages': None  
             }
             
-    
             if 'proof' in query and query['proof']:
                 original_proof = query['proof']
                 cleaned_proof = clean_proof_backticks(original_proof)
@@ -240,16 +253,26 @@ async def predict_detail(input_text: InputText):
                 require_verification=True
             )
             
-            while not proof.is_result_ready():
-                pass
-            
-            result = proof.result
+            try:
+                result = await wait_for_proof_result(proof)
+            except TimeoutError:
+                logger.error("Verification timeout")
+                rewards.append(-1.0)
+                continue
+            except Exception as e:
+                logger.error(f"Error during verification: {e}")
+                rewards.append(-1.0)
+                continue
+                
             verification_time = time.time() - start_time
             
             error_positions = parse_error_positions(
                 result.get('output', ''), 
                 query['proof']  
             )
+            
+            reward = calculate_reward(result, error_positions, query['proof'])
+            rewards.append(reward)
             
             detail.update({
                 'verification_time': verification_time,
@@ -258,17 +281,11 @@ async def predict_detail(input_text: InputText):
                 'complete': result.get('complete', False),
                 'pass': result.get('pass', False),
                 'output': result.get('output', ''),
-                'error_positions': error_positions,  
-                'proof_segments': proof.segmentation(result)  
+                'error_positions': error_positions,
+                'proof_segments': proof.segmentation(result),
+                'reward': reward  
             })
             
-            if result.get('complete', False):
-                rewards.append(1.0)
-            elif result.get('pass', False):
-                rewards.append(0.5)
-            else:
-                rewards.append(-1.0)
-                
             details.append(detail)
                 
         except Exception as e:
@@ -281,10 +298,48 @@ async def predict_detail(input_text: InputText):
                 'errors': [str(e)],
                 'status': 'error',
                 'complete': False,
-                'pass': False
+                'pass': False,
+                'reward': -1.0 
             })
-            
+    
+    assert len(rewards) == len(input_text.query), (
+        f"Rewards length ({len(rewards)}) does not match "
+        f"input queries length ({len(input_text.query)})"
+    )
     return {"rewards": rewards, "details": details}
+
+def calculate_reward(result, error_positions, proof_content):
+    """Calculate fine-grained reward"""
+    if result.get('complete', False):
+        return 1.0
+    elif result.get('pass', False):
+        return 0.5
+        
+    # Start handling failure cases with detailed rewards
+    if not proof_content or not proof_content.strip():
+        return -1.0  # Empty proof
+        
+    if not proof_content.startswith(':='):
+        return -0.8  # Basic format error
+    
+    # Calculate penalty based on error positions
+    if error_positions:
+        first_error_line = min(pos['line'] for pos in error_positions)
+        total_lines = len(proof_content.split('\n'))
+        
+        # Earlier errors result in heavier penalties
+        progress_ratio = first_error_line / total_lines
+        base_penalty = -0.7
+        
+        # Adjust penalty based on progress, lighter near the end
+        adjusted_penalty = base_penalty + (0.4 * progress_ratio)
+        
+        # Further adjust based on error count
+        error_count_penalty = min(0.1 * len(error_positions), 0.3)
+        return adjusted_penalty - error_count_penalty
+    
+    # Other unknown errors
+    return -0.5
 
 @app.on_event("shutdown")
 async def shutdown_event():
