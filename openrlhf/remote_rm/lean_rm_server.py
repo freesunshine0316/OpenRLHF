@@ -5,7 +5,7 @@ import re
 import asyncio  
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List
+from typing import List, Union, Dict, Any
 from asyncio import Queue, Lock
 
 from openrlhf.remote_rm.ds_prover.lean.verifier import Lean4ServerScheduler
@@ -36,20 +36,20 @@ app = FastAPI()
 
 
 lean4_scheduler = Lean4ServerScheduler(
-    max_concurrent_requests=32,  
+    max_concurrent_requests=256,  
     timeout=600,               
     memory_limit=80,           
     name='verifier'
 )
 
 logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    level=logging.INFO,  
+    format='%(asctime)s [%(levelname)s] %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 class InputText(BaseModel):
-    query: List[str]  # List of strings containing theorem and proof
+    query: List[Union[str, Dict[str, str]]]  # 支持字符串列表或字典列表
 
 class OutputPrediction(BaseModel):
     rewards: List[float]
@@ -145,14 +145,27 @@ async def wait_for_proof_result(proof, timeout=300):
         raise
 
 
+@app.get("/status")
+async def get_status():
+    return {
+        "active_requests": len(lean4_scheduler.request_statuses),
+        "queue_size": len(lean4_scheduler.task_queue),
+        "workers": len(lean4_scheduler.processes)
+    }
+
 @app.post("/predict")
 async def predict(input_text: InputText) -> OutputPrediction:
-    logger.info(f"Received request: {input_text}")
+    queue_size = len(lean4_scheduler.task_queue)
+    if queue_size > 1000:
+        logger.warning(f"Queue size: {queue_size}")
+    
     rewards = []
-
     for query in input_text.query:
         try:
             start_time = time.time()
+            
+            # 只保留关键日志
+            logger.info(f"Processing batch of {len(input_text.query)} queries")
             
             # If formal_statement and proof are directly provided
             if isinstance(query, dict) and 'formal_statement' in query:
@@ -205,9 +218,12 @@ async def predict(input_text: InputText) -> OutputPrediction:
             logger.info(f"Verification completed in {time.time() - start_time:.2f} seconds")
             logger.info(f"Final rewards: {rewards}")
 
+            # 简化进度日志
+            if len(rewards) % 10 == 0:  # 每10个请求打印一次进度
+                logger.info(f"Progress: {len(rewards)}/{len(input_text.query)}")
+
         except Exception as e:
-            logger.error(f"Error processing query: {str(e)}")
-            logger.error(traceback.format_exc())
+            logger.error(f"Error: {str(e)}")
             rewards.append(-1.0)
 
     assert len(rewards) == len(input_text.query), (
@@ -225,66 +241,83 @@ async def predict_detail(input_text: InputText):
     for query in input_text.query:
         try:
             start_time = time.time()
+            
+            # 处理不同的输入格式
+            if isinstance(query, dict):
+                formal_statement = query.get('formal_statement', '')
+                proof_content = query.get('proof', '')
+            else:
+                # 处理字符串格式
+                formal_statement, proof_content = extract_proof_content(query)
+            
             detail = {
-                'formal_statement': query['formal_statement'],
+                'formal_statement': formal_statement,
                 'verification_time': None,
                 'errors': None,
                 'status': None,
                 'complete': False,
                 'pass': False,
-                'output': None,  
-                'system_messages': None  
+                'output': None,
+                'system_messages': None
             }
             
-            if 'proof' in query and query['proof']:
-                original_proof = query['proof']
-                cleaned_proof = clean_proof_backticks(original_proof)
-                if original_proof != cleaned_proof:
+            if proof_content:
+                cleaned_proof = clean_proof_backticks(proof_content)
+                if proof_content != cleaned_proof:
                     detail['cleaned_proof'] = True
-                query['proof'] = cleaned_proof
-            
-            summarizer = ProofSummarizer(
-                data={'formal_statement': query['formal_statement']},
-                scheduler=lean4_scheduler
-            )
-            
-            proof = summarizer.analyze(
-                code=query['proof'],
-                require_verification=True
-            )
+                proof_content = cleaned_proof
             
             try:
-                result = await wait_for_proof_result(proof)
-            except TimeoutError:
-                logger.error("Verification timeout")
-                rewards.append(-1.0)
-                continue
-            except Exception as e:
-                logger.error(f"Error during verification: {e}")
-                rewards.append(-1.0)
-                continue
+                summarizer = ProofSummarizer(
+                    data={'formal_statement': formal_statement},
+                    scheduler=lean4_scheduler
+                )
                 
-            verification_time = time.time() - start_time
-            
-            error_positions = parse_error_positions(
-                result.get('output', ''), 
-                query['proof']  
-            )
-            
-            reward = calculate_reward(result, error_positions, query['proof'])
-            rewards.append(reward)
-            
-            detail.update({
-                'verification_time': verification_time,
-                'errors': result.get('errors', []),
-                'status': result.get('status', 'unknown'),
-                'complete': result.get('complete', False),
-                'pass': result.get('pass', False),
-                'output': result.get('output', ''),
-                'error_positions': error_positions,
-                'proof_segments': proof.segmentation(result),
-                'reward': reward  
-            })
+                proof = summarizer.analyze(
+                    code=proof_content,
+                    require_verification=True
+                )
+                
+                result = await wait_for_proof_result(proof)
+                verification_time = time.time() - start_time
+                
+                error_positions = parse_error_positions(
+                    result.get('output', ''), 
+                    proof_content
+                )
+                
+                reward = calculate_reward(result, error_positions, proof_content)
+                rewards.append(reward)
+                
+                detail.update({
+                    'verification_time': verification_time,
+                    'errors': result.get('errors', []),
+                    'status': result.get('status', 'unknown'),
+                    'complete': result.get('complete', False),
+                    'pass': result.get('pass', False),
+                    'output': result.get('output', ''),
+                    'error_positions': error_positions,
+                    'proof_segments': proof.segmentation(result) if hasattr(proof, 'segmentation') else None,
+                    'reward': reward
+                })
+                
+            except TimeoutError as e:
+                logger.error("Verification timeout")
+                rewards.append(-0.6)
+                detail.update({
+                    'errors': ['Verification timeout'],
+                    'status': 'timeout',
+                    'reward': -0.6
+                })
+            except Exception as e:
+                logger.error(f"Error during verification: {str(e)}")
+                logger.error(traceback.format_exc())
+                rewards.append(-1.0)
+                detail.update({
+                    'errors': [str(e)],
+                    'status': 'error',
+                    'reward': -1.0
+                })
             
             details.append(detail)
                 
@@ -293,19 +326,14 @@ async def predict_detail(input_text: InputText):
             logger.error(traceback.format_exc())
             rewards.append(-1.0)
             details.append({
-                'formal_statement': query['formal_statement'],
-                'verification_time': None,
+                'formal_statement': formal_statement if 'formal_statement' in locals() else 'Unknown',
                 'errors': [str(e)],
                 'status': 'error',
                 'complete': False,
                 'pass': False,
-                'reward': -1.0 
+                'reward': -1.0
             })
     
-    assert len(rewards) == len(input_text.query), (
-        f"Rewards length ({len(rewards)}) does not match "
-        f"input queries length ({len(input_text.query)})"
-    )
     return {"rewards": rewards, "details": details}
 
 def calculate_reward(result, error_positions, proof_content):
