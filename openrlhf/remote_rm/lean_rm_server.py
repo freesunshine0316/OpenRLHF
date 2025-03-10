@@ -496,7 +496,7 @@ async def predict_zero(input_text: InputText) -> OutputPrediction:
     return {"rewards": rewards}
 
 
-def calculate_reward(result, error_positions, proof_content):
+def calculate_reward_time(result, error_positions, proof_content):
     """Calculate reward based on verification result with adjusted timeout penalty"""
     if result.get('status') == 'timeout':
         elapsed_time = result.get('elapsed_time', 0)
@@ -507,7 +507,7 @@ def calculate_reward(result, error_positions, proof_content):
             return -0.6  # 中等惩罚
         else:
             return -0.4  # 轻微惩罚
-            
+
     if not result.get('pass', False):
         return -1.0
     if result.get('complete', False):
@@ -517,6 +517,41 @@ def calculate_reward(result, error_positions, proof_content):
             return 1.2  # 额外奖励
         return 1.0
     return 0.0
+
+
+def calculate_reward(result, error_positions, proof_content):
+    """Calculate fine-grained reward"""
+    if result.get("complete", False):
+        return 1.0
+    elif result.get("pass", False):
+        return 0.5
+
+    # Start handling failure cases with detailed rewards
+    if not proof_content or not proof_content.strip():
+        return -1.0  # Empty proof
+
+    if not proof_content.startswith(":="):
+        return -0.8  # Basic format error
+
+    # Calculate penalty based on error positions
+    if error_positions:
+        first_error_line = min(pos["line"] for pos in error_positions)
+        total_lines = len(proof_content.split("\n"))
+
+        # Earlier errors result in heavier penalties
+        progress_ratio = first_error_line / total_lines
+        base_penalty = -0.7
+
+        # Adjust penalty based on progress, lighter near the end
+        adjusted_penalty = base_penalty + (0.4 * progress_ratio)
+
+        # Further adjust based on error count
+        error_count_penalty = min(0.1 * len(error_positions), 0.3)
+        return adjusted_penalty - error_count_penalty
+
+    # Other unknown errors
+    return -0.5
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
