@@ -149,3 +149,13 @@ core
 *jianh*
 *test_scripts*
 */checkpoint/*
+
+# wandb
+wandb/
+*.wandb
+
+#ray
+./ray_results
+
+# Local scripts
+scripts/*local*.sh
