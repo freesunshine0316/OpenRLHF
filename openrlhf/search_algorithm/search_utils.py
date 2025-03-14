@@ -4,9 +4,6 @@ DEFAULT_N = 8
 DEFAULT_BEAM_SIZE = 4
 DEFAULT_SEARCH_STEPS = 5
 DEFAULT_TEMPERATURE = 1.0
-DEFAULT_BEAM_SIZE = 4
-DEFAULT_SEARCH_STEPS = 5
-DEFAULT_TEMPERATURE = 1.0
 DEFAULT_MAX_LENGTH = 1024
 DEFAULT_MAX_STEP_LENGTH = 256
 DEFAULT_PRM_URLS = ["http://30.159.163.212:8001/predict", "http://30.159.163.212:8002/predict", "http://30.159.163.212:8003/predict", "http://30.159.163.212:8004/predict"]
@@ -55,7 +52,7 @@ class Tree:
 
     def get_beam_to_expand(self, beam_size=5):
         curr_timestep = self.return_timestep()
-        latest_nodes = [node for node in self.all_nodes if node.timestep == curr_timestep]
+        latest_nodes = [node for node in self.all_nodes if node.timestep == curr_timestep or node.is_leaf]
         beam = sorted(latest_nodes, key=lambda x: x.value, reverse=True)[:beam_size]
         return [node for node in beam if not node.is_leaf]
 ########

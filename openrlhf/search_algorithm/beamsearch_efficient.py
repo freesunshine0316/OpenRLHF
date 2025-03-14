@@ -7,6 +7,11 @@ import ray
 import numpy as np
 import jsonlines
 from tqdm import tqdm
+import random
+import requests
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+import threading
 
 #### Search Tree ####
 from openrlhf.search_algorithm.search_utils import Node
@@ -54,7 +59,7 @@ def get_full_traj(traj, tokenizer, actor, greedy=False):
     input_ids = tokenizer(traj, return_tensors="pt")
     input_ids = {k: v.to(actor.model.device) for k, v in input_ids.items()}
     outputs = actor.model.generate(**input_ids, do_sample=not greedy, max_new_tokens=1024,
-                             temperature=DEFAULT_TEMPERATURE, tokenizer=tokenizer,
+                             temperature=TEMPERATURE, tokenizer=tokenizer, 
                              pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
     sequences = tokenizer.batch_decode(outputs, keep_special_tokens=True)
     sequences = [clean_pad_token(seq, tokenizer.pad_token) for seq in sequences]
@@ -64,7 +69,7 @@ def get_next_steps(trajs, tokenizer, actor):
     input_ids = tokenizer(trajs, padding=True, return_tensors="pt")
     input_ids = {k: v.to(actor.model.device) for k, v in input_ids.items()}
     outputs = actor.model.generate(**input_ids, do_sample=True, stop_strings=END_OF_STEP, max_new_tokens=MAX_NEW_TOKENS,
-                             temperature=DEFAULT_TEMPERATURE, tokenizer=tokenizer, pad_token_id=tokenizer.pad_token_id)
+                             temperature=TEMPERATURE, tokenizer=tokenizer, pad_token_id=tokenizer.pad_token_id)
     input_len = input_ids["input_ids"].shape[1]
     sequences = tokenizer.batch_decode(outputs[:, input_len:], keep_special_tokens=True)
     sequences = [clean_pad_token(seq, tokenizer.pad_token) for seq in sequences]
@@ -76,37 +81,27 @@ def get_step_scores(trajs, tokenizer, critic):
     outputs = critic.compute_value(**input_ids, return_dict=False)
     return (torch.clamp(outputs[0].squeeze(), min=-1, max=1) + 1) / 2
 
-def search(query, tokenizer, actor, critic=None, search_args=None):
-
-    beam_size = search_args.get("beam_size", DEFAULT_BEAM_SIZE)
-    candidate_size = search_args.get("candidate_size", DEFAULT_N)
-    assert candidate_size % beam_size == 0
-    expand_size = candidate_size // beam_size
-    search_steps = search_args.get("search_steps", DEFAULT_SEARCH_STEPS)
-    max_step_length = search_args.get("max_step_length", DEFAULT_MAX_STEP_LENGTH)
-    max_length = search_args.get("max_length", DEFAULT_MAX_LENGTH)
-    add_greedy = search_args["add_greedy"]
-
+def search(query, tokenizer, actor, critic):
     tree = Tree(query)
     query = tree.question
-    for search_iter in range(search_steps):
-        actions = tree.get_beam_to_expand(beam_size)
+    for search_iter in range(LIMIT):
+        actions = tree.get_beam_to_expand(BEAM)
         if search_iter < 1:
-            actions = actions * beam_size
+            actions = actions * BEAM
         if actions:
             trajs = [action.print_path() for action in actions]
-            trajs, anchors = trajs * expand_size, actions * expand_size
+            trajs, anchors = trajs * (N // BEAM), actions * (N // BEAM)
             with torch.no_grad():
                 next_steps = get_next_steps(trajs, tokenizer, actor)
                 next_values = get_step_scores([traj + next_step for traj, next_step in zip(trajs, next_steps)], tokenizer, critic)
             for anchor, traj, next_step, next_value in zip(anchors, trajs, next_steps, next_values):
                 state = tree.add_node(next_step, next_value.item(), anchor, next_step.endswith(tokenizer.eos_token))
-                if len(next_step) == 0 or len(next_step) > max_step_length or len(traj + next_step) > max_length:
+                if len(next_step) == 0 or len(next_step) > MAX_CHAR_PER_STEP or len(traj + next_step) > MAX_CHAR_PER_PATH:
                     state.value = -1
                 # print((search_iter, traj, next_step, next_value))
         else:
             break
-
+    
     # return the best traj
     terminal_nodes = [node for node in tree.all_nodes if node.is_leaf]
     final_traj = None
@@ -117,8 +112,8 @@ def search(query, tokenizer, actor, critic=None, search_args=None):
         with torch.no_grad():
             final_traj = get_full_traj(query, tokenizer, actor)
         # return None
-
-    if add_greedy:
+    
+    if ADD_GREEDY:
         with torch.no_grad():
             greedy_traj = get_full_traj(query, tokenizer, actor, greedy=True)
         return [final_traj, greedy_traj]
@@ -133,7 +128,7 @@ def get_full_traj_vllm(trajs, tokenizer, actor):
         top_p=1,
         top_k=-1,
         max_tokens=MAX_LENGTH,
-        min_tokens=1,
+        min_tokens=4,
         skip_special_tokens=False,
         include_stop_str_in_output=True,
         logprobs = 0,
@@ -168,7 +163,7 @@ def get_next_steps_vllm(trajs, tokenizer, actor):
         top_p=1,
         top_k=-1,
         max_tokens=MAX_LENGTH,
-        min_tokens=1,
+        min_tokens=4, # experienced to be 4
         stop=END_OF_STEP,
         skip_special_tokens=False,
         include_stop_str_in_output=True,
@@ -237,6 +232,7 @@ def get_next_steps_vllm(trajs, tokenizer, actor):
 #     pbar.close()
 #     return results
 
+# 传入多个会OOM，最好就传一个
 def call_reward(texts):
     if isinstance(texts, str):
         texts = [texts]
@@ -244,6 +240,22 @@ def call_reward(texts):
     pload ={"texts": texts}
     response =requests.post(url, json=pload)
     return response.json()["rewards"]
+
+def call_reward_multi_thread(texts):
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        futures = []
+        for text in texts:
+            future = executor.submit(call_reward, text)
+            futures.append(future)
+        
+        results = []
+        for future in futures:
+            try:
+                results.append(future.result()[0])
+            except Exception as e:
+                print(f"Error processing query: {str(e)}")
+                results.append(0)  # 或者根据需求处理异常
+    return results
 
 def occupy_gpu(stop_event, device='cuda:0'):
     device = torch.device(device)
@@ -269,11 +281,14 @@ def occupy_gpu(stop_event, device='cuda:0'):
     except Exception as e:
         print(f"[{device}] 发生异常: {str(e)}")
 
+DEBUG = False
+
 # multi-threads
 def process_single_query(query, args):
     """处理单个查询的线程函数"""
     tree = Tree(query)
     processed_query = tree.question
+    search_args = args["search_args"]
     
     for search_iter in range(args["LIMIT"]):
         actions = tree.get_beam_to_expand(args["BEAM"])
@@ -295,15 +310,18 @@ def process_single_query(query, args):
             next_steps, sum_logps, avg_logps = get_next_steps_vllm(
             expanded_trajs, args["tokenizer"], args["actor"]
         )
-        next_values = avg_logps if args["search_args"]["compute_reward_strategy"] == "average" else sum_logps
+            
+        if search_args["reward_strategy"] == "prm":
+            new_trajs = [traj + next_step for traj, next_step in zip(expanded_trajs, next_steps)]
+            next_values = call_reward_multi_thread(new_trajs)
+        elif search_args["reward_strategy"] == "prob":
+            next_values = []
+            for anchor, logprob in zip(expanded_anchors, avg_logps if args["search_args"]["compute_reward_strategy"] == "average" else sum_logps):
+                next_values.append(logprob + anchor.value if anchor.parent is not None else logprob)
+        else:
+            raise Exception(f"不支持的reward_strategy: {search_args['reward_strategy']}")
 
         for anchor, traj, next_step, next_value in zip(expanded_anchors, expanded_trajs, next_steps, next_values):
-            if search_args["reward_strategy"] == "prm":
-                next_value = call_reward([traj + next_step])[0]
-            elif search_args["reward_strategy"] == "prob":
-                next_value += anchor.value if anchor.parent is not None else 0
-            else:
-                raise Exception(f"不支持的reward_strategy: {search_args['reward_strategy']}")
             state = tree.add_node(
                 next_step, 
                 next_value, 
@@ -312,6 +330,9 @@ def process_single_query(query, args):
             )
             if len(next_step) == 0 or not any(next_step.endswith(eos) for eos in END_OF_STEP):
                 state.value = min(-100, state.value)
+
+        if DEBUG and torch.distributed.get_rank() == 0:
+            print((search_iter, next_steps, sum_logps, avg_logps, next_values))
 
     # 返回最佳轨迹
     terminal_nodes = [node for node in tree.all_nodes if node.is_leaf]
@@ -322,9 +343,6 @@ def process_single_query(query, args):
         with torch.no_grad():
             return get_full_traj_vllm(processed_query, args["tokenizer"], args["actor"])[0][0]
 
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
-import threading
 
 def search_vllm(queries, tokenizer, actor, critic=None, search_args=None):
     """多线程处理主函数"""

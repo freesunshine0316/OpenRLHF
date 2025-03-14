@@ -159,20 +159,19 @@ def search_vllm(queries, tokenizer, actor, critic=None, search_args=None):
             _rewards = avg_logprobs[i:i+search_budget]
         else:
             raise Exception("Invalid compute_reward_strategy")
-
         _trajs = trajs[i:i+search_budget]
         if search_args["voting"]:
             predictions = {} # we do not remove [INVALID], as the model has to learn good format
             for traj, reward in zip(_trajs, _rewards):
                 hyp = extract_answer(clean_eos(traj, tokenizer.eos_token), "math")
-                found_cluster = False
+                flag = False
                 for k in predictions:
                     if grade_answer(k, hyp):
-                        found_cluster = True
-                        predictions[k]["score"] += 1 # hard voting
+                        flag = True
+                        predictions[k]["score"] += 1 # cannot use logprob here
                         predictions[k]["trajs"].append({"text": traj, "reward": reward})
                         break
-                if not found_cluster:
+                if not flag:
                     predictions[hyp] = {"score": 1, "trajs": [{"text": traj, "reward": reward}]}
             sorted_trajs = sorted(predictions.values(), key=lambda x: x["score"], reverse=True)
             best_trajs = sorted_trajs[0]["trajs"]

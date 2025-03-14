@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List
 
+import re
 import torch
 from transformers import AutoModel, AutoTokenizer
 import torch.nn.functional as F
@@ -32,6 +33,7 @@ def split_query_and_response(text):
     query = q.split("Question:")[1].strip()
     if a.endswith("<|endoftext|>"):
         a = a[:-len("<|endoftext|>")].strip()
+    a = re.sub(r"\n+", "\n", a).strip()
     response = [step.strip() for step in a.split("\n")]
     return query, response
 
