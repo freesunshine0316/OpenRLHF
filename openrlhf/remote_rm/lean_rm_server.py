@@ -6,13 +6,12 @@ import asyncio
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Union, Dict, Any
-from asyncio import Queue, Lock
 import random
 import re
+import os
+import psutil
 
-# 在已有导入后添加
 from transformers import AutoTokenizer
-
 
 try:
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
@@ -23,72 +22,10 @@ from openrlhf.remote_rm.ds_prover.lean.verifier import Lean4ServerScheduler
 from openrlhf.remote_rm.ds_prover.lean.proof import ProofSummarizer
 from openrlhf.remote_rm.ds_prover.utils import AttrDict
 
-class Lean4ServerManager:
-    def __init__(self, max_concurrent=8):
-        self.queue = Queue()
-        self.active_requests = 0
-        self.lock = Lock()
-        self.max_concurrent = max_concurrent
-        self.stats = {
-            'processed': 0,
-            'failed': 0,
-            'timeouts': 0,
-            'total_processing_time': 0,
-            'last_report_time': time.time()
-        }
-    
-        self.monitor_task = asyncio.create_task(self._monitor_queue())
-    
-    async def _monitor_queue(self):
-        while True:
-            try:
-                queue_size = self.queue.qsize()
-                now = time.time()
-                if now - self.stats['last_report_time'] >= 60:  
-                    avg_time = 0
-                    if self.stats['processed'] > 0:
-                        avg_time = self.stats['total_processing_time'] / self.stats['processed']
-                    
-                    logger.info(
-                        f"Service Stats: active={self.active_requests}, queue={queue_size}, "
-                        f"processed={self.stats['processed']}, failed={self.stats['failed']}, "
-                        f"timeouts={self.stats['timeouts']}, avg_time={avg_time:.2f}s"
-                    )
-                
-                    self.stats.update({
-                        'processed': 0,
-                        'failed': 0,
-                        'timeouts': 0,
-                        'total_processing_time': 0,
-                        'last_report_time': now
-                    })
-            
-                if queue_size > 100:
-                    logger.warning(f"High load detected! Queue size: {queue_size}")
-                
-                await asyncio.sleep(10) 
-            except Exception as e:
-                logger.error(f"Error in monitor task: {e}")
-                await asyncio.sleep(30)  
-
-    async def process_request(self, request):
-        if self.active_requests >= self.max_concurrent:
-            await self.queue.put(request)
-            return await self.queue.get()
-        
-        async with self.lock:
-            self.active_requests += 1
-        try:
-            return await self._process(request)
-        finally:
-            self.active_requests -= 1
-
-
 app = FastAPI()
 
-
 lean4_scheduler = Lean4ServerScheduler(
-    max_concurrent_requests=256,  
+    max_concurrent_requests=1,  
     timeout=600,               
     memory_limit=80,           
     name='verifier'
@@ -184,17 +121,17 @@ def extract_proof_content(text):
     return formal_statement, proof_content
 
 
-async def wait_for_proof_result(proof, timeout=300): 
+async def wait_for_proof_result(proof, timeout=600, processing_start_time=None): 
     try:
-        start_time = time.time()
+        # Use the passed processing start time, or the current time if not provided
+        start_time = processing_start_time or time.time()
         elapsed_time = 0
+        
         while not proof.is_result_ready():
             elapsed_time = time.time() - start_time
-            if elapsed_time > 180 and elapsed_time % 60 < 0.2: 
-                logger.warning(f"Proof verification taking long time: {elapsed_time:.1f}s")
-            
+            # Check timeout here, ensure it's based on the processing start time
             if elapsed_time > timeout:
-                logger.warning(f"Proof verification timeout after {timeout}s")
+                logger.warning(f"Proof verification timeout after {timeout}s (since processing start)")
                 return {
                     'pass': False,
                     'complete': False,
@@ -204,6 +141,11 @@ async def wait_for_proof_result(proof, timeout=300):
                     'output': '',
                     'elapsed_time': elapsed_time  
                 }
+            
+
+            if elapsed_time > 180 and elapsed_time % 60 < 0.2:  # logging after 3 minutes
+                logger.warning(f"Proof verification taking long time: {elapsed_time:.1f}s")
+            
             await asyncio.sleep(0.1)
             
         verification_time = time.time() - start_time
@@ -228,7 +170,6 @@ async def wait_for_proof_result(proof, timeout=300):
 
 @app.get("/status")
 async def get_status():
-    # 获取活跃请求数和队列长度
     active_requests = len(lean4_scheduler.request_statuses)
     queue_size = len(lean4_scheduler.task_queue)
     workers = len(lean4_scheduler.processes)
@@ -251,14 +192,14 @@ async def get_status():
             "load15": load15,
             "memory_percent": mem_percent
         },
-        "status": "overloaded" if queue_size > 200 else "normal",
+        "status": "overloaded" if queue_size >50 else "normal",
         "timestamp": time.time()
     }
 
 @app.post("/predict")
 async def predict(input_text: InputText) -> OutputPrediction:
     queue_size = len(lean4_scheduler.task_queue)
-    if queue_size > 1000:
+    if queue_size > 10:
         logger.warning(f"Queue size: {queue_size}")
     
     queue_start_time = time.time()
@@ -318,8 +259,8 @@ async def predict(input_text: InputText) -> OutputPrediction:
                 rewards.append(-0.6)  # Lighter penalty for timeout
                 continue
 
-            # 添加超时预警
-            if time.time() - start_time > 30:  # 如果已经运行了30秒，记录一个警告
+            # Add timeout warning
+            if time.time() - start_time > 30:  # If running for more than 30 seconds, log a warning
                 logger.warning(f"Request {request_id}: Processing taking longer than expected ({time.time() - start_time:.1f}s)")
 
             logger.info(f"Request {request_id}: Completed in {time.time() - start_time:.2f} seconds with reward {reward}")
@@ -344,12 +285,12 @@ async def predict_detail(input_text: InputText):
         try:
             start_time = time.time()
 
-            # 处理不同的输入格式
+            # Handle different input formats
             if isinstance(query, dict):
                 formal_statement = query.get('formal_statement', '')
                 proof_content = query.get('proof', '')
             else:
-                # 处理字符串格式
+                # Handle string format
                 formal_statement, proof_content = extract_proof_content(query)
 
             detail = {
@@ -447,12 +388,12 @@ async def predict_zero(input_text: InputText) -> OutputPrediction:
     rewards = []
 
     for i, query in enumerate(input_text.query):
-        # 提取生成的证明
+        # Extract the generated proof
         if isinstance(query, dict):
             text = query.get("proof", "")
         else:
             text = query
-            # 尝试提取证明部分
+            # Try to extract the proof part
             if ":=" in text:
                 text = text.split(":=", 1)[1]
 
@@ -466,15 +407,18 @@ async def predict_zero(input_text: InputText) -> OutputPrediction:
             token_count = len(text.split()) + (len(text) // 10)  
 
         if token_count > 1500:
+            reward = -1.0
+            logger.info(f"Query {i}:  ({token_count} tokens), reward={reward}")
+        elif token_count > 1300:
+            reward =-0.8
+        elif token_count > 1100:
+            reward =-0.6
+            logger.info(f"Query {i}:  ({token_count} tokens), reward={reward}")
+        elif token_count > 900:
             reward = -0.4
             logger.info(f"Query {i}:  ({token_count} tokens), reward={reward}")
-        elif token_count > 1400:
-            reward =-0.3
-        elif token_count > 1300:
-            reward =0.1
-            logger.info(f"Query {i}:  ({token_count} tokens), reward={reward}")
-        elif token_count > 1200:
-            reward = 0.2
+        elif token_count > 700:
+            reward = -0.1
             logger.info(f"Query {i}:  ({token_count} tokens), reward={reward}")
         elif token_count < 100:
             reward = -0.5
@@ -483,7 +427,7 @@ async def predict_zero(input_text: InputText) -> OutputPrediction:
             reward = -0.1
             logger.info(f"Query {i}:  ({token_count} tokens), reward={reward}")
         else:
-            reward = round(random.uniform(0, 0.8), 1)
+            reward = round(random.uniform(-0.2, 0.5), 1)
             if random.random() < 0.6: 
                 reward = abs(reward)
             logger.info(f"Query {i}:  ({token_count} tokens), reward={reward}")
@@ -498,33 +442,35 @@ async def predict_zero(input_text: InputText) -> OutputPrediction:
 
 def calculate_reward_time(result, error_positions, proof_content):
     """Calculate reward based on verification result with adjusted timeout penalty"""
+    # Not used in the current implementation
     if result.get('status') == 'timeout':
         elapsed_time = result.get('elapsed_time', 0)
-        # 根据花费时间给予不同程度的惩罚，鼓励模型生成可以更快验证的代码
-        if elapsed_time > 250:  # 接近超时限制
-            return -0.8  # 严重惩罚
-        elif elapsed_time > 150:  # 超过一半时间
-            return -0.6  # 中等惩罚
+        # Give different levels of penalties based on time spent, encouraging the model to generate code that can be verified faster
+        if elapsed_time > 250:  # Close to timeout limit
+            return -0.8  # Severe penalty
+        elif elapsed_time > 150:  # More than half the time
+            return -0.6  # Medium penalty
         else:
-            return -0.4  # 轻微惩罚
+            return -0.4  # Slight penalty
 
     if not result.get('pass', False):
         return -1.0
     if result.get('complete', False):
-        # 对于成功验证的情况，可以根据验证时间给予额外奖励
+        # For successful verification, additional rewards can be given based on verification time
         elapsed_time = result.get('elapsed_time', 0)
-        if elapsed_time < 30:  # 快速验证
-            return 1.2  # 额外奖励
+        if elapsed_time < 30:  # Fast verification
+            return 1.2  # Extra reward
         return 1.0
     return 0.0
 
 
 def calculate_reward(result, error_positions, proof_content):
     """Calculate fine-grained reward"""
+    # double the reward if the proof is correct
     if result.get("complete", False):
-        return 1.0
+        return 3.0
     elif result.get("pass", False):
-        return 0.5
+        return 1.5
 
     # Start handling failure cases with detailed rewards
     if not proof_content or not proof_content.strip():
