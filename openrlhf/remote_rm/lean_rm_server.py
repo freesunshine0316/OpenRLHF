@@ -25,8 +25,8 @@ from openrlhf.remote_rm.ds_prover.utils import AttrDict
 app = FastAPI()
 
 lean4_scheduler = Lean4ServerScheduler(
-    max_concurrent_requests=1,  
-    timeout=600,               
+    max_concurrent_requests=4,   # control process number
+    timeout=600,      # control timeout time           
     memory_limit=80,           
     name='verifier'
 )
@@ -196,7 +196,7 @@ async def get_status():
         "timestamp": time.time()
     }
 
-@app.post("/predict")
+@app.post("/predict_lean")
 async def predict(input_text: InputText) -> OutputPrediction:
     queue_size = len(lean4_scheduler.task_queue)
     if queue_size > 10:

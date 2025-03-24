@@ -80,7 +80,7 @@ fi
 
 echo "Starting lean verification server..."
 # Use nohup to ensure the process continues to run in the background
-nohup gunicorn -w 32 -k uvicorn.workers.UvicornWorker "openrlhf.remote_rm.lean_rm_server:app" -b 0.0.0.0:1239 > lean_rm.log 2>&1   &
+nohup gunicorn -w 16 -k uvicorn.workers.UvicornWorker "openrlhf.remote_rm.lean_rm_server:app" -b 0.0.0.0:1239 > lean_rm.log 2>&1  &  
 
 # Wait for the server to start completely
 echo "Waiting for server to start..."
@@ -112,13 +112,13 @@ deepspeed --module openrlhf.cli.train_ppo \
   --pretrain /app/qi/backup/models/Goedel-Prover-SFT \
   --critic_pretrain /app/qi/backup/models/Goedel-Prover-SFT \
   --save_path ./checkpoint/goedal-rlhf-v3  \
-  --save_steps  3 \
+  --save_steps  100 \
   --logging_steps 1 \
   --eval_steps 20 \
-  --micro_train_batch_size 2 \
-  --train_batch_size 128 \
-  --micro_rollout_batch_size 2 \
-  --rollout_batch_size 128 \
+  --micro_train_batch_size 1 \
+  --train_batch_size 64 \
+  --micro_rollout_batch_size 1 \
+  --rollout_batch_size 64 \
   --max_epochs 1 \
   --prompt_max_len 1024 \
   --generate_max_len 2048 \
@@ -129,10 +129,15 @@ deepspeed --module openrlhf.cli.train_ppo \
   --prompt_data /app/qi/backup/data/RPROVER/lean_proofs_data \
   --input_key context_messages \
   --apply_chat_template \
-  --max_samples 10000 \
+  --max_samples 5000 \
   --normalize_reward \
-  --adam_offload \
   --gradient_checkpointing \
+  --zero_stage 2 \
   --use_wandb f3b175fa54df63e7b0592b1bf157744eba49ef44 \
-  --remote_rm_url http://localhost:1239/predict \
-  --flash_attn 
+  --remote_rm_url http://localhost:1239/predict_lean \
+  --flash_attn  \
+  --adam_offload \
+
+
+
+   
