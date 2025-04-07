@@ -31,17 +31,17 @@ ray job submit --address="http://127.0.0.1:8265" \
    --remote_rm_url ${RM_URL} \
    --save_path ${OUTPUT} \
    --ckpt_path ${OUTPUT} \
-   --micro_train_batch_size 1 \
+   --micro_train_batch_size 4 \
    --train_batch_size 128 \
-   --micro_rollout_batch_size 1 \
+   --micro_rollout_batch_size 4\
    --rollout_batch_size 128 \
    --temperature 0.6 \
    --n_samples_per_prompt 1 \
-   --max_samples 100000 \
+   --max_samples 30000 \
    --max_epochs 1 \
    --num_episodes 500 \
    --max_len 2048 \
-   --zero_stage 3 \
+   --zero_stage 2 \
    --bf16 \
    --actor_learning_rate 5e-7 \
    --critic_learning_rate 9e-6 \
