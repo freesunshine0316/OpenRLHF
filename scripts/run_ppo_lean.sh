@@ -111,7 +111,7 @@ echo "===== Starting PPO training ====="
 deepspeed --module openrlhf.cli.train_ppo \
   --pretrain /app/qi/backup/models/Goedel-Prover-SFT \
   --critic_pretrain /app/qi/backup/models/Goedel-Prover-SFT \
-  --save_path ./checkpoint/goedal-rlhf-v3  \
+  --save_path ./checkpoint/goedal-rlhf-v5-d2  \
   --save_steps  100 \
   --logging_steps 1 \
   --eval_steps 20 \
@@ -129,7 +129,7 @@ deepspeed --module openrlhf.cli.train_ppo \
   --prompt_data /app/qi/backup/data/RPROVER/lean_proofs_data \
   --input_key context_messages \
   --apply_chat_template \
-  --max_samples 5000 \
+  --max_samples 2000 \
   --normalize_reward \
   --gradient_checkpointing \
   --zero_stage 2 \
